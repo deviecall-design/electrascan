@@ -1,102 +1,84 @@
 /**
- * ElectraScan — PDF Detection Engine
- * ====================================
- * Accepts a PDF file (from email attachment, upload, or camera capture),
- * converts each page to a base64 image, sends to Claude Vision,
- * and returns a structured list of detected electrical components
- * mapped to Vesh pricing ready for the estimate engine.
+ * ElectraScan — PDF Detection Engine v4
+ * =======================================
+ * KEY CHANGE FROM v3:
+ * Pass 1 now captures BOTH symbol descriptions AND text from the legend.
+ * Pass 2 uses symbol patterns as a visual decoder key for the floor plan scan.
  *
- * Based on DetectionSpec v1.0 — 31 March 2026
- * Do not modify component type keys or flag identifiers without
- * updating the pricing map and Zod schema simultaneously.
+ * Logic:
+ *   Pass 1 — Read legend → extract symbol visual descriptions + quantities + Vesh pricing
+ *   Pass 2 — Scan floor plan using symbol decoder → distribute by room
+ *   Result — Symbol-matched quantities × Vesh catalogue prices = accurate estimate
  */
 
 import Anthropic from "@anthropic-ai/sdk";
 import * as pdfjsLib from "pdfjs-dist";
+pdfjsLib.GlobalWorkerOptions.workerSrc = `https://unpkg.com/pdfjs-dist@${pdfjsLib.version}/build/pdf.worker.min.mjs`;
+import { mapLegendItem, type CatalogueItem } from "./vesh_catalogue";
 
 // ─────────────────────────────────────────────
-// 1. COMPONENT TYPES  (must match DetectionSpec §2 exactly)
+// TYPES
 // ─────────────────────────────────────────────
 
 export type ComponentType =
-  // Power
-  | "GPO_STANDARD"
-  | "GPO_DOUBLE"
-  | "GPO_WEATHERPROOF"
-  | "GPO_USB"
-  // Lighting
-  | "DOWNLIGHT_RECESSED"
-  | "PENDANT_FEATURE"
-  | "EXHAUST_FAN"
-  // Switching
-  | "SWITCHING_STANDARD"
-  | "SWITCHING_DIMMER"
-  | "SWITCHING_2WAY"
-  // Switchboard
-  | "SWITCHBOARD_MAIN"
-  | "SWITCHBOARD_SUB"
-  // Air conditioning
-  | "AC_SPLIT"
-  | "AC_DUCTED"
-  // Data / Comms
-  | "DATA_CAT6"
-  | "DATA_TV"
-  // Security
-  | "SECURITY_CCTV"
-  | "SECURITY_INTERCOM"
-  | "SECURITY_ALARM"
-  // EV / Pool / Access
-  | "EV_CHARGER"
-  | "POOL_OUTDOOR"
-  | "GATE_ACCESS"
-  // Automation
+  | "GPO_STANDARD" | "GPO_DOUBLE" | "GPO_WEATHERPROOF" | "GPO_USB"
+  | "DOWNLIGHT_RECESSED" | "PENDANT_FEATURE" | "EXHAUST_FAN"
+  | "SWITCHING_STANDARD" | "SWITCHING_DIMMER" | "SWITCHING_2WAY"
+  | "SWITCHBOARD_MAIN" | "SWITCHBOARD_SUB"
+  | "AC_SPLIT" | "AC_DUCTED"
+  | "DATA_CAT6" | "DATA_TV"
+  | "SECURITY_CCTV" | "SECURITY_INTERCOM" | "SECURITY_ALARM"
+  | "EV_CHARGER" | "POOL_OUTDOOR" | "GATE_ACCESS"
   | "AUTOMATION_HUB";
 
-// ─────────────────────────────────────────────
-// 2. FLAG IDENTIFIERS  (DetectionSpec §3)
-// ─────────────────────────────────────────────
-
 export type DetectionFlag =
-  | "HEIGHT_RISK"         // Fitting > 3.5m — scaffold/crane required
-  | "AUTOMATION_DEPENDENCY" // Requires C-Bus/KNX/Dali programmer
-  | "MISSING_CIRCUIT"     // Equipment shown but no circuit on drawing
-  | "SCOPE_CONFIRM"       // Unclear if in-scope — needs estimator call
-  | "OUTDOOR_LOCATION"    // External install — weatherproof required
-  | "OFF_FORM_PREMIUM"    // Off-form concrete — premium applies
-  | "CABLE_RUN_LONG"      // Cable run > 20m from MSB
-  | "LOW_CONFIDENCE"      // Confidence 50–69 — estimator must verify
-  | "SYMBOL_AMBIGUOUS";   // Confidence < 50 — excluded from estimate
+  | "HEIGHT_RISK" | "AUTOMATION_DEPENDENCY" | "MISSING_CIRCUIT"
+  | "SCOPE_CONFIRM" | "OUTDOOR_LOCATION" | "OFF_FORM_PREMIUM"
+  | "CABLE_RUN_LONG" | "LOW_CONFIDENCE" | "SYMBOL_AMBIGUOUS"
+  | "LEGEND_MISMATCH" | "NOT_ELECTRICAL_SCOPE" | "FROM_LEGEND";
 
-// ─────────────────────────────────────────────
-// 3. DETECTED COMPONENT  (DetectionSpec §4)
-// ─────────────────────────────────────────────
+export interface LegendItem {
+  symbol_description: string;
+  symbol_visual: string;        // Visual description of the symbol e.g. "small red filled circle"
+  quantity: number;
+  unit: string;
+  mapped_type: ComponentType | null;
+  catalogue_id: string | null;
+  catalogue_price: number | null;
+  in_electrical_scope: boolean;
+  automation_flag: boolean;
+  notes: string;
+}
 
 export interface DetectedComponent {
   type: ComponentType;
   quantity: number;
-  room: string;               // e.g. "Kitchen", "Bed 2", "Outdoor"
-  drawing_ref: string;        // e.g. "E-01 Sheet 3"
-  confidence: number;         // 0–100
-  needs_review: boolean;      // true if confidence < 90
+  room: string;
+  drawing_ref: string;
+  confidence: number;
+  needs_review: boolean;
   flags: DetectionFlag[];
-  notes: string;              // Any extra context from drawing
-  unit_price: number;         // From Vesh pricing map
-  line_total: number;         // unit_price × quantity (+ off-form if flagged)
+  notes: string;
+  unit_price: number;
+  line_total: number;
+  legend_quantity?: number;
+  legend_match?: boolean;
+  catalogue_item_name?: string;
+  symbol_visual?: string;
 }
 
-// ─────────────────────────────────────────────
-// 4. DETECTION RESULT  (full response shape)
-// ─────────────────────────────────────────────
-
 export interface DetectionResult {
-  drawing_version: string;    // e.g. "001"
+  drawing_version: string;
   page_count: number;
-  processed_at: string;       // ISO timestamp
-  scale_detected: string;     // e.g. "1:100" or "unknown"
+  processed_at: string;
+  scale_detected: string;
+  legend_found: boolean;
+  legend_items: LegendItem[];
   components: DetectedComponent[];
   risk_flags: RiskFlag[];
-  estimate_subtotal: number;  // Sum of all line_totals (excludes GST)
-  raw_response: string;       // Always stored for debugging
+  estimate_subtotal: number;
+  raw_response: string;
+  raw_legend_response: string;
 }
 
 export interface RiskFlag {
@@ -107,431 +89,499 @@ export interface RiskFlag {
 }
 
 // ─────────────────────────────────────────────
-// 5. VESH PRICING MAP  (DetectionSpec §7)
+// FALLBACK PRICING
 // ─────────────────────────────────────────────
 
-const VESH_PRICING: Record<ComponentType, number> = {
-  // Power
-  GPO_STANDARD:       260,
-  GPO_DOUBLE:         310,
-  GPO_WEATHERPROOF:   410,
-  GPO_USB:            380,
-  // Lighting
-  DOWNLIGHT_RECESSED: 220,
-  PENDANT_FEATURE:    260,
-  EXHAUST_FAN:        195,
-  // Switching
-  SWITCHING_STANDARD: 120,
-  SWITCHING_DIMMER:   285,
-  SWITCHING_2WAY:     165,
-  // Switchboard
-  SWITCHBOARD_MAIN:   1800,
-  SWITCHBOARD_SUB:    950,
-  // Air conditioning
-  AC_SPLIT:           480,
-  AC_DUCTED:          620,
-  // Data / Comms
-  DATA_CAT6:          185,
-  DATA_TV:            145,
-  // Security
-  SECURITY_CCTV:      380,
-  SECURITY_INTERCOM:  650,
-  SECURITY_ALARM:     220,
-  // EV / Pool / Access
-  EV_CHARGER:         850,
-  POOL_OUTDOOR:       420,
-  GATE_ACCESS:        680,
-  // Automation
-  AUTOMATION_HUB:     1200,
+const FALLBACK_PRICING: Record<ComponentType, number> = {
+  GPO_STANDARD: 260, GPO_DOUBLE: 260, GPO_WEATHERPROOF: 290, GPO_USB: 360,
+  DOWNLIGHT_RECESSED: 200, PENDANT_FEATURE: 600, EXHAUST_FAN: 215,
+  SWITCHING_STANDARD: 120, SWITCHING_DIMMER: 220, SWITCHING_2WAY: 200,
+  SWITCHBOARD_MAIN: 1800, SWITCHBOARD_SUB: 950,
+  AC_SPLIT: 480, AC_DUCTED: 620,
+  DATA_CAT6: 360, DATA_TV: 550,
+  SECURITY_CCTV: 300, SECURITY_INTERCOM: 250, SECURITY_ALARM: 360,
+  EV_CHARGER: 1000, POOL_OUTDOOR: 380, GATE_ACCESS: 400,
+  AUTOMATION_HUB: 1200,
 };
 
-const OFF_FORM_PREMIUM_DEFAULT = 150; // Per point when OFF_FORM_PREMIUM flagged
-
-// Risk level map for flag → severity
 const FLAG_RISK_LEVELS: Record<DetectionFlag, RiskFlag["level"]> = {
-  HEIGHT_RISK:           "high",
-  AUTOMATION_DEPENDENCY: "medium",
-  MISSING_CIRCUIT:       "high",
-  SCOPE_CONFIRM:         "medium",
-  OUTDOOR_LOCATION:      "info",
-  OFF_FORM_PREMIUM:      "info",
-  CABLE_RUN_LONG:        "medium",
-  LOW_CONFIDENCE:        "info",
-  SYMBOL_AMBIGUOUS:      "medium",
+  HEIGHT_RISK: "high", AUTOMATION_DEPENDENCY: "medium",
+  MISSING_CIRCUIT: "high", SCOPE_CONFIRM: "medium",
+  OUTDOOR_LOCATION: "info", OFF_FORM_PREMIUM: "info",
+  CABLE_RUN_LONG: "medium", LOW_CONFIDENCE: "info",
+  SYMBOL_AMBIGUOUS: "medium", LEGEND_MISMATCH: "medium",
+  NOT_ELECTRICAL_SCOPE: "info", FROM_LEGEND: "info",
 };
 
 // ─────────────────────────────────────────────
-// 6. CLAUDE VISION SYSTEM PROMPT  (DetectionSpec §5)
+// PASS 1 — SYMBOL-AWARE LEGEND EXTRACTION
 // ─────────────────────────────────────────────
 
-const ELECTRASCAN_SYSTEM_PROMPT = `You are ElectraScan, an AI assistant specialised in reading Australian residential and light-commercial electrical drawings.
+const LEGEND_SYSTEM_PROMPT = `You are ElectraScan reading the legend/key/schedule from an Australian electrical or architectural drawing.
 
-Your job is to detect every electrical component on the drawing and return a structured JSON response.
+Find the LEGEND, KEY or SCHEDULE table — usually in a corner of the drawing.
 
-COMPONENT TYPES you must detect (use ONLY these exact type keys):
-Power: GPO_STANDARD, GPO_DOUBLE, GPO_WEATHERPROOF, GPO_USB
-Lighting: DOWNLIGHT_RECESSED, PENDANT_FEATURE, EXHAUST_FAN
-Switching: SWITCHING_STANDARD, SWITCHING_DIMMER, SWITCHING_2WAY
-Switchboard: SWITCHBOARD_MAIN, SWITCHBOARD_SUB
-Air Conditioning: AC_SPLIT, AC_DUCTED
-Data/Comms: DATA_CAT6, DATA_TV
-Security: SECURITY_CCTV, SECURITY_INTERCOM, SECURITY_ALARM
-EV/Pool/Access: EV_CHARGER, POOL_OUTDOOR, GATE_ACCESS
-Automation: AUTOMATION_HUB
+For EVERY row in the legend extract:
+1. The SYMBOL — describe its visual appearance precisely (e.g. "small red filled circle", "blue double horizontal line", "orange arrow pointing right", "X mark in circle", "grid square with H", "star burst shape")
+2. The TEXT description exactly as written
+3. The quantity shown
+4. Whether it needs electrical wiring or a motor connection
 
-FLAGS to apply when conditions are met:
-- HEIGHT_RISK: any fitting shown at > 3.5m height (void, double-height ceiling)
-- AUTOMATION_DEPENDENCY: C-Bus, KNX, Dali, or smart switch annotations present
-- MISSING_CIRCUIT: equipment shown on plan but no circuit shown on electrical drawing
-- SCOPE_CONFIRM: symbol unclear or component may be in a different trade's scope
-- OUTDOOR_LOCATION: component is on an external wall or outdoor area
-- OFF_FORM_PREMIUM: component is in an off-form concrete area
-- CABLE_RUN_LONG: estimated cable run from MSB exceeds 20 metres
-- LOW_CONFIDENCE: symbol is present but unclear — confidence 50–69
-- SYMBOL_AMBIGUOUS: symbol cannot be reliably identified — confidence < 50
+SCOPE RULES — include ALL of these:
+✓ All lighting (downlights, LED strip, wall lights, pendants, track lights, surface lights)
+✓ Power points (GPO, double power point, Hager, Zetr, weatherproof)
+✓ Switches (ZETR, Dynalite, conventional, dimmer)
+✓ Motorised blinds — IN SCOPE (motor wiring required)
+✓ Ceiling fans — IN SCOPE
+✓ Exhaust fans — IN SCOPE
+✓ Heated towel rails — IN SCOPE (hardwired)
+✓ Underfloor heating — IN SCOPE (dedicated circuit)
+✓ Automation touchscreens, sensors, keypads
+✓ Door bell, intercom, CCTV
+✓ EV chargers, car charger points
+✓ Smoke detectors
 
-CONFIDENCE RULES:
-- 90–100: Clear, unambiguous symbol. Auto-confirm.
-- 70–89: Symbol present but unclear annotation. Flag needs_review: true.
-- 50–69: Context-based inference. Add LOW_CONFIDENCE flag.
-- 0–49: Too uncertain. Add SYMBOL_AMBIGUOUS flag. Still include in response.
-
-SCALE: Try to read the drawing scale from the scale bar or title block (e.g. "1:100"). Report it in scale_detected. If not found, report "unknown".
-
-RESPONSE FORMAT: Return ONLY a valid JSON object — no markdown, no explanation, no code fences.
-
+Return ONLY valid JSON — no markdown:
 {
-  "scale_detected": "1:100",
-  "components": [
+  "legend_found": true,
+  "scale_detected": "1:50",
+  "items": [
     {
-      "type": "GPO_DOUBLE",
-      "quantity": 6,
-      "room": "Kitchen",
-      "drawing_ref": "E-01 Sheet 1",
-      "confidence": 95,
-      "needs_review": false,
-      "flags": [],
-      "notes": "Shown above bench height on north wall"
+      "symbol_visual": "small red filled circle",
+      "symbol_description": "Recessed pair of Down Lights",
+      "quantity": 18,
+      "unit": "EA",
+      "in_electrical_scope": true,
+      "notes": "Red dot symbol on ceiling plan"
+    },
+    {
+      "symbol_visual": "orange right-pointing arrow",
+      "symbol_description": "Motorised Blind",
+      "quantity": 14,
+      "unit": "EA",
+      "in_electrical_scope": true,
+      "notes": "Motor wiring and connection required"
+    },
+    {
+      "symbol_visual": "X mark",
+      "symbol_description": "Ceiling Fan",
+      "quantity": 4,
+      "unit": "EA",
+      "in_electrical_scope": true,
+      "notes": "Ceiling fan point including wiring"
     }
   ]
-}
-
-IMPORTANT RULES:
-- Count every instance — do not group across rooms. One entry per room per type.
-- If a symbol appears in multiple rooms, create separate entries.
-- Never invent components not visible on the drawing.
-- If in doubt, include the component with a LOW_CONFIDENCE flag rather than omit it.
-- Return ONLY the JSON object. No other text.`;
+}`;
 
 // ─────────────────────────────────────────────
-// 7. PDF → IMAGE CONVERSION
+// PASS 2 — FLOOR PLAN SCAN WITH SYMBOL DECODER
 // ─────────────────────────────────────────────
 
-/**
- * Converts a PDF file to an array of base64-encoded PNG images,
- * one per page, at high resolution suitable for Claude Vision.
- */
+const buildFloorPlanPrompt = (legendItems: LegendItem[]): string => {
+  const inScope = legendItems.filter(l => l.in_electrical_scope && l.catalogue_price);
+
+  const symbolDecoder = inScope.map(l =>
+    `  SYMBOL: ${l.symbol_visual} → "${l.symbol_description}" → ${l.quantity} EA total across whole drawing → type: ${l.mapped_type}`
+  ).join("\n");
+
+  return `You are ElectraScan scanning an Australian electrical floor plan.
+
+SYMBOL DECODER — use this to identify every mark on the drawing:
+${symbolDecoder}
+
+YOUR JOB:
+1. Scan every room on the floor plan
+2. Count each symbol type in each room using the decoder above
+3. The room-by-room totals MUST add up to the legend quantities
+4. Use exact room names from the drawing labels
+
+RULES:
+- One entry per room per symbol type
+- If a symbol appears in a corridor or unlabelled space → use "Hallway" or "General"
+- Confidence: 95 if clearly visible, 80 if partially visible, 65 if inferred
+- Add AUTOMATION_DEPENDENCY flag for any Dynalite/Dali/motorised items
+- Add HEIGHT_RISK flag for items in voids or double-height spaces
+
+Return ONLY valid JSON:
+{
+  "scale_detected": "1:50",
+  "components": [
+    {
+      "legend_description": "Recessed pair of Down Lights",
+      "type": "DOWNLIGHT_RECESSED",
+      "quantity": 6,
+      "room": "Kitchen",
+      "drawing_ref": "Sheet 1",
+      "confidence": 95,
+      "flags": [],
+      "notes": "Red dot symbols counted in kitchen area"
+    },
+    {
+      "legend_description": "Motorised Blind",
+      "type": "AUTOMATION_HUB",
+      "quantity": 4,
+      "room": "Living/Dining",
+      "drawing_ref": "Sheet 1",
+      "confidence": 90,
+      "flags": ["AUTOMATION_DEPENDENCY"],
+      "notes": "Orange arrow symbols along north wall"
+    }
+  ]
+}`;
+};
+
+// ─────────────────────────────────────────────
+// PDF → IMAGES
+// ─────────────────────────────────────────────
+
 async function pdfToImages(file: File): Promise<string[]> {
   const arrayBuffer = await file.arrayBuffer();
-  const uint8Array = new Uint8Array(arrayBuffer);
-
-  const pdfDoc = await pdfjsLib.getDocument({ data: uint8Array }).promise;
-  const pageCount = pdfDoc.numPages;
+  const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(arrayBuffer) }).promise;
   const images: string[] = [];
-
-  for (let pageNum = 1; pageNum <= pageCount; pageNum++) {
-    const page = await pdfDoc.getPage(pageNum);
-
-    // Render at 2x scale for better symbol recognition
-    const scale = 2.0;
-    const viewport = page.getViewport({ scale });
-
-    // Create an offscreen canvas
+  for (let i = 1; i <= pdf.numPages; i++) {
+    const page = await pdf.getPage(i);
+    const viewport = page.getViewport({ scale: 2.0 });
     const canvas = document.createElement("canvas");
     canvas.width = viewport.width;
     canvas.height = viewport.height;
-    const ctx = canvas.getContext("2d")!;
-
-    await page.render({
-      canvasContext: ctx,
-      viewport,
-    }).promise;
-
-    // Convert to base64 PNG (strip the data:image/png;base64, prefix)
-    const dataUrl = canvas.toDataURL("image/png");
-    const base64 = dataUrl.split(",")[1];
-    images.push(base64);
+    await page.render({ canvasContext: canvas.getContext("2d")!, viewport }).promise;
+    images.push(canvas.toDataURL("image/png").split(",")[1]);
   }
-
   return images;
 }
 
-// ─────────────────────────────────────────────
-// 8. JSON EXTRACTION  (DetectionSpec §11)
-// ─────────────────────────────────────────────
-
-/**
- * Strip markdown fences Claude occasionally wraps around JSON
- * despite the system prompt instructing otherwise.
- */
 function extractJSON(raw: string): string {
-  return raw
-    .replace(/^```(?:json)?\s*/im, "")
-    .replace(/\s*```$/im, "")
-    .trim();
+  return raw.replace(/^```(?:json)?\s*/im, "").replace(/\s*```$/im, "").trim();
 }
 
 // ─────────────────────────────────────────────
-// 9. PRICING & FLAG ENRICHMENT
+// CATALOGUE MATCHING
 // ─────────────────────────────────────────────
 
-/**
- * Takes raw Claude output components and enriches them with:
- * - Unit price from Vesh pricing map
- * - Line total (with off-form premium if flagged)
- * - Forced LOW_CONFIDENCE flag injection (DetectionSpec §11)
- * - needs_review enforcement
- */
-function enrichComponents(
-  rawComponents: Omit<
-    DetectedComponent,
-    "unit_price" | "line_total"
-  >[]
-): DetectedComponent[] {
-  return rawComponents
-    .filter((c) => c.confidence >= 50) // Exclude < 50 from estimate
-    .map((c) => {
-      // Force LOW_CONFIDENCE flag if confidence < 70 (DetectionSpec §11)
-      const flags = [...c.flags];
-      if (c.confidence < 70 && !flags.includes("LOW_CONFIDENCE")) {
-        flags.push("LOW_CONFIDENCE");
+function matchToVesh(description: string): {
+  catalogueItem: CatalogueItem | null;
+  price: number;
+  componentType: ComponentType;
+  automationFlag: boolean;
+} {
+  const match = mapLegendItem(description);
+  if (match) {
+    return {
+      catalogueItem: match,
+      price: match.price,
+      componentType: match.componentType as ComponentType,
+      automationFlag: match.automationFlag ?? false,
+    };
+  }
+
+  const d = description.toLowerCase()
+    .replace(/zetr t3/g, "zetr 13")   // normalise T3 → 13
+    .replace(/zetr t2/g, "zetr 12");  // normalise T2 → 12
+
+  // ── Check SWITCHES first — before any GPO checks ──
+  // This prevents "ZETR 13 series light switch" matching the $525 GPO price
+  if (d.includes("light switch") || d.includes("series light switch") ||
+      (d.includes("switch") && !d.includes("power") && !d.includes("gpo") && !d.includes("powerpoint"))) {
+    if (d.includes("dynalite") || d.includes("dali")) return { catalogueItem: null, price: 180, componentType: "SWITCHING_STANDARD", automationFlag: true };
+    if (d.includes("dimmer")) return { catalogueItem: null, price: 220, componentType: "SWITCHING_DIMMER", automationFlag: false };
+    if (d.includes("2 way") || d.includes("2-way")) return { catalogueItem: null, price: 200, componentType: "SWITCHING_2WAY", automationFlag: false };
+    if (d.includes("3 way") || d.includes("3-way")) return { catalogueItem: null, price: 250, componentType: "SWITCHING_STANDARD", automationFlag: false };
+    return { catalogueItem: null, price: 120, componentType: "SWITCHING_STANDARD", automationFlag: false };
+  }
+
+  // ── Lighting ──
+  if (d.includes("track light")) return { catalogueItem: null, price: 1000, componentType: "DOWNLIGHT_RECESSED", automationFlag: false };
+  if (d.includes("led strip") && (d.includes("dali") || d.includes("dynalite"))) return { catalogueItem: null, price: 450, componentType: "DOWNLIGHT_RECESSED", automationFlag: true };
+  if (d.includes("led strip") || d.includes("strip light")) return { catalogueItem: null, price: 400, componentType: "DOWNLIGHT_RECESSED", automationFlag: false };
+  if (d.includes("wall light") || d.includes("art light")) return { catalogueItem: null, price: 250, componentType: "DOWNLIGHT_RECESSED", automationFlag: false };
+  if (d.includes("pendant") || d.includes("feature light")) return { catalogueItem: null, price: 600, componentType: "PENDANT_FEATURE", automationFlag: false };
+  if (d.includes("surface can") || d.includes("can light")) return { catalogueItem: null, price: 200, componentType: "DOWNLIGHT_RECESSED", automationFlag: false };
+  if (d.includes("downlight") || d.includes("down light") || d.includes("recessed")) return { catalogueItem: null, price: 200, componentType: "DOWNLIGHT_RECESSED", automationFlag: false };
+
+  // ── Automation & special ──
+  if (d.includes("automation touchscreen")) return { catalogueItem: null, price: 1200, componentType: "AUTOMATION_HUB", automationFlag: true };
+  if (d.includes("motorised blind") || d.includes("blind motor")) return { catalogueItem: null, price: 380, componentType: "AUTOMATION_HUB", automationFlag: true };
+  if (d.includes("dynalite") || d.includes("dali")) return { catalogueItem: null, price: 180, componentType: "SWITCHING_STANDARD", automationFlag: true };
+
+  // ── Fans ──
+  if (d.includes("ceiling fan")) return { catalogueItem: null, price: 450, componentType: "EXHAUST_FAN", automationFlag: false };
+  if (d.includes("exhaust fan")) return { catalogueItem: null, price: 215, componentType: "EXHAUST_FAN", automationFlag: false };
+
+  // ── GPO / Power points — Zetr brand variants FIRST ──
+  const isGPO = d.includes("gpo") || d.includes("power point") || d.includes("powerpoint") || d.includes("double power");
+  if (isGPO || d.includes("zetr 13") || d.includes("zetr 12")) {
+    if ((d.includes("zetr 13") || d.includes("zetr t3")) && d.includes("carbon")) return { catalogueItem: null, price: 750, componentType: "GPO_DOUBLE", automationFlag: false };
+    if ((d.includes("zetr 13") || d.includes("zetr t3")) && d.includes("usb")) return { catalogueItem: null, price: 650, componentType: "GPO_USB", automationFlag: false };
+    if (d.includes("zetr 13") || d.includes("zetr t3")) return { catalogueItem: null, price: 525, componentType: "GPO_DOUBLE", automationFlag: false };
+    if (d.includes("zetr 12") || d.includes("zetr t2")) return { catalogueItem: null, price: 425, componentType: "GPO_DOUBLE", automationFlag: false };
+    if (d.includes("weatherproof") || d.includes("wp")) return { catalogueItem: null, price: 290, componentType: "GPO_WEATHERPROOF", automationFlag: false };
+    if (d.includes("usb")) return { catalogueItem: null, price: 360, componentType: "GPO_USB", automationFlag: false };
+    return { catalogueItem: null, price: 260, componentType: "GPO_DOUBLE", automationFlag: false };
+  }
+
+  // ── Other ──
+  if (d.includes("sensor") || d.includes("light sensor") || d.includes("pir")) return { catalogueItem: null, price: 380, componentType: "SWITCHING_STANDARD", automationFlag: false };
+  if (d.includes("towel rail")) return { catalogueItem: null, price: 450, componentType: "GPO_STANDARD", automationFlag: false };
+  if (d.includes("underfloor")) return { catalogueItem: null, price: 450, componentType: "GPO_STANDARD", automationFlag: false };
+  if (d.includes("intercom") || d.includes("door bell")) return { catalogueItem: null, price: 250, componentType: "SECURITY_INTERCOM", automationFlag: false };
+  if (d.includes("dual tv") || d.includes("tv/data") || d.includes("data outlet") || d.includes("tv data")) return { catalogueItem: null, price: 550, componentType: "DATA_TV", automationFlag: false };
+
+  return { catalogueItem: null, price: 200, componentType: "DOWNLIGHT_RECESSED", automationFlag: false };
+}
+
+// ─────────────────────────────────────────────
+// ENRICH LEGEND ITEMS
+// ─────────────────────────────────────────────
+
+function enrichLegendItems(rawItems: any[]): LegendItem[] {
+  return rawItems.map(item => {
+    const { catalogueItem, price, componentType, automationFlag } =
+      matchToVesh(item.symbol_description ?? "");
+    return {
+      symbol_description: item.symbol_description ?? "",
+      symbol_visual: item.symbol_visual ?? "unknown symbol",
+      quantity: item.quantity ?? 0,
+      unit: item.unit ?? "EA",
+      mapped_type: componentType,
+      catalogue_id: catalogueItem?.id ?? null,
+      catalogue_price: price,
+      in_electrical_scope: item.in_electrical_scope !== false,
+      automation_flag: automationFlag,
+      notes: item.notes ?? "",
+    };
+  });
+}
+
+// ─────────────────────────────────────────────
+// BUILD FINAL COMPONENT LIST
+// ─────────────────────────────────────────────
+
+function buildComponents(legendItems: LegendItem[], roomComponents: any[]): DetectedComponent[] {
+  const components: DetectedComponent[] = [];
+  const legendByDesc = new Map<string, LegendItem>();
+  legendItems.forEach(l => legendByDesc.set(l.symbol_description.toLowerCase(), l));
+
+  // Process room distribution
+  for (const c of roomComponents) {
+    const legendDesc = (c.legend_description ?? "").toLowerCase();
+    let legendItem: LegendItem | undefined = legendByDesc.get(legendDesc);
+
+    if (!legendItem) {
+      for (const [key, item] of legendByDesc) {
+        if (key.includes(legendDesc) || legendDesc.includes(key)) {
+          legendItem = item; break;
+        }
       }
+    }
+    if (!legendItem) {
+      legendItem = legendItems.find(l => l.mapped_type === c.type && l.in_electrical_scope);
+    }
 
-      const unitPrice = VESH_PRICING[c.type] ?? 0;
-      const offFormPremium = flags.includes("OFF_FORM_PREMIUM")
-        ? OFF_FORM_PREMIUM_DEFAULT
-        : 0;
-      const effectiveUnitPrice = unitPrice + offFormPremium;
+    const price = legendItem?.catalogue_price ?? FALLBACK_PRICING[c.type as ComponentType] ?? 200;
+    const qty = c.quantity ?? 1;
+    const flags: DetectionFlag[] = [...(c.flags ?? [])];
+    if (legendItem?.automation_flag && !flags.includes("AUTOMATION_DEPENDENCY")) {
+      flags.push("AUTOMATION_DEPENDENCY");
+    }
 
-      return {
-        ...c,
-        flags,
-        needs_review: c.confidence < 90,
-        unit_price: effectiveUnitPrice,
-        line_total: effectiveUnitPrice * c.quantity,
-      };
+    components.push({
+      type: (c.type ?? "DOWNLIGHT_RECESSED") as ComponentType,
+      quantity: qty,
+      room: c.room ?? "General",
+      drawing_ref: c.drawing_ref ?? "",
+      confidence: c.confidence ?? 85,
+      needs_review: (c.confidence ?? 85) < 90,
+      flags,
+      notes: c.notes ?? "",
+      unit_price: price,
+      line_total: price * qty,
+      legend_quantity: legendItem?.quantity,
+      legend_match: true,
+      catalogue_item_name: legendItem?.symbol_description,
+      symbol_visual: legendItem?.symbol_visual,
     });
-}
+  }
 
-/**
- * Generates risk flag records from component flags.
- */
-function generateRiskFlags(components: DetectedComponent[]): RiskFlag[] {
-  const flags: RiskFlag[] = [];
+  // Add any legend items completely missed by room scan
+  const coveredDescs = new Set(roomComponents.map(c => (c.legend_description ?? "").toLowerCase()));
 
-  const riskDescriptions: Record<DetectionFlag, string> = {
-    HEIGHT_RISK:
-      "Fitting installed above 3.5m — scaffold or EWP required. Add height allowance to estimate.",
-    AUTOMATION_DEPENDENCY:
-      "Smart switching or automation protocol detected. Requires licensed programmer — add to scope.",
-    MISSING_CIRCUIT:
-      "Equipment shown on architectural plan but no dedicated circuit on electrical drawing. Confirm scope with architect.",
-    SCOPE_CONFIRM:
-      "Symbol unclear — confirm with architect whether this item is in the electrical scope.",
-    OUTDOOR_LOCATION:
-      "External installation — confirm IP rating and weatherproofing requirement.",
-    OFF_FORM_PREMIUM:
-      "Off-form concrete finish. Off-form premium of $100–$200 per point applies.",
-    CABLE_RUN_LONG:
-      "Estimated cable run exceeds 20m from MSB. Verify run length and add cable allowance.",
-    LOW_CONFIDENCE:
-      "Symbol detected but unclear. Estimator should verify quantity and type on drawing.",
-    SYMBOL_AMBIGUOUS:
-      "Symbol could not be reliably identified. Manual check required before including in estimate.",
-  };
-
-  for (const component of components) {
-    for (const flag of component.flags) {
-      // Only add each flag type once per component type
-      const alreadyAdded = flags.some(
-        (f) => f.flag === flag && f.component_type === component.type
-      );
-      if (!alreadyAdded) {
-        flags.push({
-          flag,
-          level: FLAG_RISK_LEVELS[flag],
-          component_type: component.type,
-          description: riskDescriptions[flag],
-        });
-      }
+  for (const l of legendItems) {
+    if (!l.in_electrical_scope || !l.catalogue_price || l.quantity === 0) continue;
+    const desc = l.symbol_description.toLowerCase();
+    const covered = [...coveredDescs].some(d => d.includes(desc) || desc.includes(d));
+    if (!covered) {
+      console.log(`[ElectraScan v4] Adding missed legend item: ${l.symbol_description} ×${l.quantity} @ $${l.catalogue_price}`);
+      const flags: DetectionFlag[] = ["FROM_LEGEND"];
+      if (l.automation_flag) flags.push("AUTOMATION_DEPENDENCY");
+      components.push({
+        type: (l.mapped_type ?? "DOWNLIGHT_RECESSED") as ComponentType,
+        quantity: l.quantity,
+        room: "General",
+        drawing_ref: "From legend",
+        confidence: 85,
+        needs_review: false,
+        flags,
+        notes: `${l.symbol_description} — ${l.quantity} ${l.unit} per legend. Symbol: ${l.symbol_visual}`,
+        unit_price: l.catalogue_price,
+        line_total: l.catalogue_price * l.quantity,
+        legend_quantity: l.quantity,
+        legend_match: true,
+        catalogue_item_name: l.symbol_description,
+        symbol_visual: l.symbol_visual,
+      });
     }
   }
 
+  return components;
+}
+
+function generateRiskFlags(components: DetectedComponent[]): RiskFlag[] {
+  const descriptions: Record<DetectionFlag, string> = {
+    HEIGHT_RISK: "Fitting above 3.5m — scaffold or EWP required.",
+    AUTOMATION_DEPENDENCY: "Automation system detected — Dynalite/Dali programmer required. Budget separately.",
+    MISSING_CIRCUIT: "Equipment shown but no dedicated circuit on electrical drawing.",
+    SCOPE_CONFIRM: "Confirm scope with architect.",
+    OUTDOOR_LOCATION: "External install — confirm IP rating.",
+    OFF_FORM_PREMIUM: "Off-form concrete — premium applies.",
+    CABLE_RUN_LONG: "Cable run exceeds 20m — verify and add allowance.",
+    LOW_CONFIDENCE: "Verify quantity on drawing before quoting.",
+    SYMBOL_AMBIGUOUS: "Symbol unclear — manual check required.",
+    LEGEND_MISMATCH: "Detected count differs from legend — verify on drawing.",
+    NOT_ELECTRICAL_SCOPE: "Item excluded from electrical scope.",
+    FROM_LEGEND: "Quantity taken from legend — room location unconfirmed.",
+  };
+
+  const flags: RiskFlag[] = [];
+  const seen = new Set<string>();
+  for (const c of components) {
+    for (const flag of c.flags) {
+      if (flag === "FROM_LEGEND") continue;
+      const key = `${flag}:${c.type}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        flags.push({ flag, level: FLAG_RISK_LEVELS[flag], component_type: c.type, description: descriptions[flag] });
+      }
+    }
+  }
   return flags;
 }
 
 // ─────────────────────────────────────────────
-// 10. MAIN DETECTION FUNCTION
+// MAIN — TWO-PASS WITH SYMBOL DECODER
 // ─────────────────────────────────────────────
 
-/**
- * Primary entry point for ElectraScan detection.
- *
- * Usage:
- *   const result = await detectElectricalComponents(file, "001");
- *
- * @param file          - The PDF file from the tradie's email or upload
- * @param drawingVersion - Version string e.g. "001", "002"
- * @param apiKey        - Anthropic API key (defaults to env var)
- */
 export async function detectElectricalComponents(
   file: File,
   drawingVersion: string = "001",
   apiKey?: string
 ): Promise<DetectionResult> {
   const client = new Anthropic({
-    apiKey: apiKey ?? import.meta.env.VITE_ANTHROPIC_API_KEY,
+    apiKey: apiKey ?? (import.meta as any).env.VITE_ANTHROPIC_API_KEY,
     dangerouslyAllowBrowser: true,
   });
 
-  // Step 1: Convert PDF pages to images
-  console.log(`[ElectraScan] Converting PDF: ${file.name}`);
+  console.log(`[ElectraScan v4] Converting: ${file.name}`);
   const pageImages = await pdfToImages(file);
-  const pageCount = pageImages.length;
-  console.log(`[ElectraScan] Converted ${pageCount} pages`);
+  const imageBlocks: Anthropic.ImageBlockParam[] = pageImages.map(base64 => ({
+    type: "image" as const,
+    source: { type: "base64" as const, media_type: "image/png" as const, data: base64 },
+  }));
 
-  // Step 2: Build multi-image message — send all pages in one call
-  // Claude Vision can handle multiple images in a single request
-  const imageContent: Anthropic.ImageBlockParam[] = pageImages.map(
-    (base64, i) => ({
-      type: "image" as const,
-      source: {
-        type: "base64" as const,
-        media_type: "image/png" as const,
-        data: base64,
-      },
-    })
-  );
-
-  const userMessage = `Drawing file: ${file.name}. Drawing version: ${drawingVersion}. This PDF has ${pageCount} page(s). Detect all electrical components across all pages and return the JSON response.`;
-
-  // Step 3: Call Claude Vision
-  console.log(`[ElectraScan] Sending to Claude Vision...`);
-  let rawResponse = "";
+  // ── PASS 1: Symbol-aware legend extraction ────
+  console.log("[ElectraScan v4] Pass 1: Reading legend + symbols...");
+  let rawLegendResponse = "";
+  let legendItems: LegendItem[] = [];
+  let legendFound = false;
+  let scaleDetected = "unknown";
 
   try {
-    const response = await client.messages.create({
+    const r = await client.messages.create({
+      model: "claude-sonnet-4-20250514",
+      max_tokens: 2000,
+      system: LEGEND_SYSTEM_PROMPT,
+      messages: [{
+        role: "user",
+        content: [
+          ...imageBlocks,
+          { type: "text", text: `Drawing: ${file.name}. Find the legend table and extract every item including its visual symbol appearance. Include ALL items that need electrical wiring including motorised blinds, ceiling fans, LED strips, heated towel rails.` },
+        ],
+      }],
+    });
+    rawLegendResponse = r.content[0].type === "text" ? r.content[0].text : "";
+    const parsed = JSON.parse(extractJSON(rawLegendResponse));
+    legendFound = parsed.legend_found ?? false;
+    scaleDetected = parsed.scale_detected ?? "unknown";
+    legendItems = enrichLegendItems(parsed.items ?? []);
+
+    const legendSubtotal = legendItems.filter(l => l.in_electrical_scope && l.catalogue_price)
+      .reduce((s, l) => s + (l.catalogue_price! * l.quantity), 0);
+    console.log(`[ElectraScan v4] Legend: ${legendItems.length} items, $${legendSubtotal.toLocaleString()} subtotal`);
+    legendItems.filter(l => l.in_electrical_scope).forEach(l => {
+      console.log(`  [${l.symbol_visual}] ${l.symbol_description}: ${l.quantity} EA @ $${l.catalogue_price}`);
+    });
+  } catch (err) {
+    console.warn("[ElectraScan v4] Legend extraction failed:", err);
+  }
+
+  // ── PASS 2: Floor plan scan with symbol decoder ─
+  console.log("[ElectraScan v4] Pass 2: Scanning floor plan with symbol decoder...");
+  let rawResponse = "";
+  let roomComponents: any[] = [];
+
+  try {
+    const r = await client.messages.create({
       model: "claude-sonnet-4-20250514",
       max_tokens: 4096,
-      system: ELECTRASCAN_SYSTEM_PROMPT,
-      messages: [
-        {
-          role: "user",
-          content: [
-            ...imageContent,
-            {
-              type: "text",
-              text: userMessage,
-            },
-          ],
-        },
-      ],
+      system: buildFloorPlanPrompt(legendItems),
+      messages: [{
+        role: "user",
+        content: [
+          ...imageBlocks,
+          { type: "text", text: `Drawing: ${file.name}. Scan every room and count each symbol type using the decoder. Total quantities must match the legend.` },
+        ],
+      }],
     });
-
-    rawResponse =
-      response.content[0].type === "text" ? response.content[0].text : "";
+    rawResponse = r.content[0].type === "text" ? r.content[0].text : "";
+    const parsed = JSON.parse(extractJSON(rawResponse));
+    if (parsed.scale_detected && scaleDetected === "unknown") scaleDetected = parsed.scale_detected;
+    roomComponents = parsed.components ?? [];
+    console.log(`[ElectraScan v4] Room distribution: ${roomComponents.length} entries across rooms`);
   } catch (err) {
-    console.error("[ElectraScan] Claude Vision API error:", err);
-    throw new Error(`Detection failed: ${err}`);
+    console.warn("[ElectraScan v4] Room scan failed:", err);
   }
 
-  // Step 4: Parse JSON (strip fences defensively)
-  let parsedResponse: {
-    scale_detected: string;
-    components: Omit<DetectedComponent, "unit_price" | "line_total">[];
-  };
+  const components = buildComponents(legendItems, roomComponents);
+  const riskFlags = generateRiskFlags(components);
+  const estimateSubtotal = components.reduce((s, c) => s + c.line_total, 0);
 
-  try {
-    const cleaned = extractJSON(rawResponse);
-    parsedResponse = JSON.parse(cleaned);
-  } catch (err) {
-    console.error("[ElectraScan] JSON parse error. Raw response:", rawResponse);
-    throw new Error(
-      `Failed to parse Claude response as JSON. Raw response stored for debugging.`
-    );
-  }
+  console.log(`[ElectraScan v4] Complete: ${components.length} items, $${estimateSubtotal.toLocaleString()}`);
 
-  // Step 5: Enrich with Vesh pricing + flag injection
-  const enrichedComponents = enrichComponents(parsedResponse.components ?? []);
-
-  // Step 6: Generate risk flags
-  const riskFlags = generateRiskFlags(enrichedComponents);
-
-  // Step 7: Calculate estimate subtotal
-  const estimateSubtotal = enrichedComponents.reduce(
-    (sum, c) => sum + c.line_total,
-    0
-  );
-
-  const result: DetectionResult = {
+  return {
     drawing_version: drawingVersion,
-    page_count: pageCount,
+    page_count: pageImages.length,
     processed_at: new Date().toISOString(),
-    scale_detected: parsedResponse.scale_detected ?? "unknown",
-    components: enrichedComponents,
+    scale_detected: scaleDetected,
+    legend_found: legendFound,
+    legend_items: legendItems,
+    components,
     risk_flags: riskFlags,
     estimate_subtotal: estimateSubtotal,
-    raw_response: rawResponse, // Always store (DetectionSpec §11)
+    raw_response: rawResponse,
+    raw_legend_response: rawLegendResponse,
   };
-
-  console.log(
-    `[ElectraScan] Detection complete: ${enrichedComponents.length} components, $${estimateSubtotal.toLocaleString()} subtotal`
-  );
-
-  return result;
 }
 
-// ─────────────────────────────────────────────
-// 11. HELPER — FORMAT RESULT FOR UI
-// ─────────────────────────────────────────────
+// ── HELPERS ────────────────────────────────────
 
-/**
- * Groups detected components by room for the component schedule UI.
- */
-export function groupByRoom(
-  components: DetectedComponent[]
-): Record<string, DetectedComponent[]> {
-  return components.reduce(
-    (acc, component) => {
-      const room = component.room || "Unknown";
-      if (!acc[room]) acc[room] = [];
-      acc[room].push(component);
-      return acc;
-    },
-    {} as Record<string, DetectedComponent[]>
-  );
+export function groupByRoom(components: DetectedComponent[]): Record<string, DetectedComponent[]> {
+  return components.reduce((acc, c) => {
+    const room = c.room || "General";
+    if (!acc[room]) acc[room] = [];
+    acc[room].push(c);
+    return acc;
+  }, {} as Record<string, DetectedComponent[]>);
 }
 
-/**
- * Returns only components that need estimator review.
- */
-export function getReviewItems(
-  components: DetectedComponent[]
-): DetectedComponent[] {
-  return components.filter((c) => c.needs_review);
-}
-
-/**
- * Returns a summary count by component type.
- */
-export function getComponentSummary(
-  components: DetectedComponent[]
-): Record<string, number> {
-  return components.reduce(
-    (acc, c) => {
-      acc[c.type] = (acc[c.type] ?? 0) + c.quantity;
-      return acc;
-    },
-    {} as Record<string, number>
-  );
+export function getReviewItems(components: DetectedComponent[]): DetectedComponent[] {
+  return components.filter(c => c.needs_review);
 }
