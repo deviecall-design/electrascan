@@ -1,876 +1,597 @@
-import React, { useState, useRef, useEffect } from 'react';
-import { listen } from '@tauri-apps/api/event';
-
-import { useKeyboardShortcuts } from './hooks/useKeyboardShortcuts';
-// import { pdfjs } from 'react-pdf'; // Removed for MuPDF implementation
-import Sidebar from './components/Sidebar';
-import BlueprintCanvas, { BlueprintCanvasRef } from './components/BlueprintCanvas';
-import Tools from './components/Tools';
-import HelpModal from './components/HelpModal';
-import NewItemModal from './components/NewItemModal';
-import UploadModal from './components/UploadModal';
-import PropertiesModal from './components/PropertiesModal';
-import PromptModal from './components/PromptModal';
-import ExportModal from './components/ExportModal';
-import ConfirmModal from './components/ConfirmModal';
-import EstimatesView from './components/EstimatesView';
-import ThreeDView from './components/ThreeDView';
-import PDFSearch from './components/PDFSearch';
-import { ToolType, ProjectData, TakeoffItem, Shape, Unit, PlanSet, LegendSettings } from './types';
-import { PresetScale, getAreaUnitFromLinear, isPointInPolygon } from './utils/geometry';
-import { useToast } from './contexts/ToastContext';
-import { generateMarkupPDF } from './utils/pdfExport';
-import { Loader2 } from 'lucide-react';
-import { useProjectManager } from './hooks/useProjectManager';
-import { useLicense } from './contexts/LicenseContext';
-import { RamCacheProvider, useRamCache } from './contexts/RamCacheContext';
-import { useViewRouter } from './components/Router';
-import { savePlanFile } from './utils/storage';
-import { flattenOCG } from './utils/flattenOCG';
-import { mupdfController, SearchHit } from './utils/mupdfController';
-import { save } from '@tauri-apps/plugin-dialog';
-import { writeFile } from '@tauri-apps/plugin-fs';
-import { LazyStore } from '@tauri-apps/plugin-store';
-
-const AppContent: React.FC = () => {
-  const { addToast } = useToast();
-  const { isLicensed } = useLicense();
-  const { viewMode, setViewMode } = useViewRouter();
-
-  const {
-    projectName,
-    items,
-    projectData,
-    planSets,
-    totalPages,
-    isSaving,
-    lastSavedAt,
-    isInitializing,
-    loadingMessage,
-    showImportConfirm,
-    showNewProjectPrompt,
-    setShowNewProjectPrompt,
-    setProjectName,
-    setHistory,
-    setHistoryTransient,
-    commitHistory,
-    undo,
-    redo,
-    canUndo,
-    canRedo,
-    handleNewProjectRequest,
-    handleNewProjectConfirmed,
-    handleSaveProject,
-    handleLoadProjectClick,
-    handleImportConfirmed,
-    setShowImportConfirm,
-    setPendingImportPath,
-  } = useProjectManager(isLicensed);
-
-  const historyState = { items, projectData, planSets, totalPages };
-
-  const [pageIndex, setPageIndex] = useState<number>(0);
-  const [zoomLevel, setZoomLevel] = useState<number>(1.0);
-
-  const [activeTool, setActiveTool] = useState<ToolType>(ToolType.SELECT);
-  const [activeTakeoffId, setActiveTakeoffId] = useState<string | null>(null);
-  const [selectedShapes, setSelectedShapes] = useState<{ itemId: string, shapeId: string }[]>([]);
-
-  const [isDeductionMode, setIsDeductionMode] = useState(false);
-  const [pendingPreset, setPendingPreset] = useState<PresetScale | null>(null);
-
-  const [showNewItemModal, setShowNewItemModal] = useState(false);
-  const [showUploadModal, setShowUploadModal] = useState(false);
-  const [showHelpModal, setShowHelpModal] = useState(false);
-  const [helpModalTab, setHelpModalTab] = useState<'guide' | 'shortcuts' | 'properties'>('guide');
-  const [editingItem, setEditingItem] = useState<TakeoffItem | null>(null);
-  const [pendingTool, setPendingTool] = useState<ToolType | null>(null);
-
-  const [showDeletePageConfirm, setShowDeletePageConfirm] = useState(false);
-  const [pageToDelete, setPageToDelete] = useState<number | null>(null);
-
-  const [showExportModal, setShowExportModal] = useState(false);
-  const [isExporting, setIsExporting] = useState(false);
-  const [exportProgress, setExportProgress] = useState({ current: 0, total: 0 });
-
-  // PDF Search state
-  const [showPDFSearch, setShowPDFSearch] = useState(false);
-  const [searchHighlights, setSearchHighlights] = useState<SearchHit[]>([]);
-  const [currentSearchHitIndex, setCurrentSearchHitIndex] = useState<number | null>(null);
-
-  const [isUploadingPdf, setIsUploadingPdf] = useState(false);
-  const [uploadLoadingMessage, setUploadLoadingMessage] = useState("Uploading PDF Plans...");
-
-  const canvasRef = useRef<BlueprintCanvasRef>(null);
-
-  useEffect(() => {
-    // Only clear selection if it's no longer valid for the current page
-    if (selectedShapes.length > 0) {
-      const validSelectedShapes = selectedShapes.filter(sel => {
-        const item = items.find(i => i.id === sel.itemId);
-        const shape = item?.shapes.find(s => s.id === sel.shapeId);
-        // Only keep shapes that exist on the CURRENT page
-        return shape && shape.pageIndex === pageIndex;
-      });
-
-      // If we have selected shapes that are not on this page, clear them
-      // This happens when switching pages while shapes are selected
-      if (validSelectedShapes.length !== selectedShapes.length) {
-        setSelectedShapes(validSelectedShapes);
-
-        // Note: We deliberately DO NOT clear activeTakeoffId here.
-        // We want to persist the "Active Recording Item" across pages so the user
-        // can continue measuring the same item on the new page.
-      }
-    }
-  }, [pageIndex, selectedShapes, items]);
-
-  const { preloadPage } = useRamCache();
-
-  // RAM Cache Preload Effect
-  useEffect(() => {
-    const uniquePages = new Set<string>();
-    const pagesToLoad: { fileId: string, index: number }[] = [];
-
-    items.forEach(item => {
-      item.shapes.forEach(shape => {
-        // Find plan set for this global page index
-        const globalIndex = shape.pageIndex;
-        const planSet = planSets.find(ps => globalIndex >= ps.startPageIndex && globalIndex < ps.startPageIndex + ps.pageCount);
-
-        if (planSet) {
-          const localIdx = globalIndex - planSet.startPageIndex;
-          // Accounting for remapped pages
-          let finalLocalIdx = localIdx;
-          if (planSet.pages && planSet.pages[localIdx] !== undefined) {
-            finalLocalIdx = planSet.pages[localIdx];
-          } else if (planSet.pages && planSet.pages.length <= localIdx) {
-            // Fallback for safety, though activePlanDetails logic suggests this:
-            finalLocalIdx = localIdx;
-          }
-
-          const key = `${planSet.id}_${finalLocalIdx}`;
-          if (!uniquePages.has(key)) {
-            uniquePages.add(key);
-            pagesToLoad.push({ fileId: planSet.id, index: finalLocalIdx });
-          }
-        }
-      });
-    });
-
-    // Execute preloads
-    pagesToLoad.forEach(p => preloadPage(p.fileId, p.index));
-  }, [items, planSets, preloadPage]);
-
-  const handleExportPDF = async (pageIndices: number[], includeLegend: boolean, includeNotes: boolean) => {
-    setIsExporting(true);
-    setExportProgress({ current: 0, total: pageIndices.length });
-    try {
-      const { pdfBytes } = await generateMarkupPDF(planSets, projectData, items, pageIndices, includeLegend, includeNotes);
-      const sanitizedProjectName = projectName.replace(/[^a-z0-9]/gi, '_');
-      const dateStr = new Date().toISOString().slice(0, 10);
-      const defaultFileName = `${sanitizedProjectName}-Markup-${dateStr}.pdf`;
-
-      // Use LazyStore to check if we have a saved export directory
-      const store = new LazyStore('settings.json');
-      const savedExportDir = await store.get<string>('pdfExportDirectory');
-
-      // Determine the default path for the save dialog
-      let defaultPath = defaultFileName;
-      if (savedExportDir) {
-        // Use saved directory + new filename
-        defaultPath = `${savedExportDir}/${defaultFileName}`;
-      }
-
-      // Show save dialog to let user pick location
-      const savePath = await save({
-        filters: [{
-          name: 'PDF Document',
-          extensions: ['pdf']
-        }],
-        defaultPath: defaultPath
-      });
-
-      // If user cancelled the dialog
-      if (!savePath) {
-        addToast("Export cancelled", 'info');
-        return;
-      }
-
-      // Save the directory for future exports (first time or when user picks new location)
-      const lastSlashIndex = Math.max(savePath.lastIndexOf('/'), savePath.lastIndexOf('\\'));
-      if (lastSlashIndex > -1) {
-        const newExportDir = savePath.substring(0, lastSlashIndex);
-        await store.set('pdfExportDirectory', newExportDir);
-        await store.save();
-      }
-
-      // Write the PDF to the chosen location
-      await writeFile(savePath, pdfBytes);
-      addToast("PDF Export successful!", 'success');
-    } catch (e) {
-      console.error("Export Error:", e);
-      addToast("Export failed. See console.", 'error');
-    } finally {
-      setIsExporting(false);
-      setShowExportModal(false);
-    }
-  };
-
-  const getCurrentPageScale = () => projectData[pageIndex]?.scale || { isSet: false, pixelsPerUnit: 0, unit: Unit.FEET };
-
-  const getActivePlanDetails = () => {
-    if (planSets.length === 0) return null;
-    for (const set of planSets) {
-      if (pageIndex >= set.startPageIndex && pageIndex < set.startPageIndex + set.pageCount) {
-        const localIdx = pageIndex - set.startPageIndex;
-        let pdfPageIndex = localIdx;
-        if (set.pages && set.pages[localIdx] !== undefined) {
-          pdfPageIndex = set.pages[localIdx];
-        } else if (set.pages && set.pages.length <= localIdx) {
-          pdfPageIndex = localIdx;
-        }
-        return { file: set.file, localPageIndex: pdfPageIndex, name: set.name, id: set.id };
-      }
-    }
-    return null;
-  };
-
-  const handleUpload = async (files: File[], names: string[]) => {
-    setShowUploadModal(false);
-    setIsUploadingPdf(true);
-    setIsUploadingPdf(true);
-    setUploadLoadingMessage("Optimizing PDF Plans (this may take a moment)...");
-    try {
-      let newPlanSets = [...planSets];
-      let currentTotalPages = totalPages;
-      for (let i = 0; i < files.length; i++) {
-        const file = files[i];
-        const name = names[i];
-
-        const fileBlob = new Blob([file], { type: 'application/pdf' });
-        const fileCopy = new File([fileBlob], file.name, { type: 'application/pdf', lastModified: file.lastModified });
-
-        const buffer = await fileCopy.arrayBuffer();
-        const bufferCopy = buffer.slice(0);
-
-        // Flatten OCGs for performance
-        let finalBuffer = bufferCopy;
-        try {
-          const flattened = await flattenOCG(new Uint8Array(bufferCopy));
-          finalBuffer = flattened.buffer as ArrayBuffer;
-        } catch (e) {
-          console.warn(`Failed to flatten ${name}, using original`, e);
-        }
-
-        // const pdf = await pdfjs.getDocument(finalBuffer.slice(0) as ArrayBuffer).promise;
-        const numPages = await mupdfController.countPagesTransient(new Uint8Array(finalBuffer));
-
-        // Re-create file from flattened buffer
-        // Use Uint8Array view for Blob to avoid ArrayBuffer/SharedArrayBuffer mismatch
-        const flattenedBlob = new Blob([new Uint8Array(finalBuffer)], { type: 'application/pdf' });
-        const flattenedFile = new File([flattenedBlob], file.name, { type: 'application/pdf', lastModified: Date.now() });
-
-        const newPlanSet: PlanSet = {
-          id: crypto.randomUUID(),
-          file: flattenedFile,
-          name,
-          pageCount: numPages,
-          startPageIndex: currentTotalPages,
-          pages: Array.from({ length: numPages }, (_, i) => i)
-        };
-        await savePlanFile(newPlanSet.id, flattenedFile);
-        newPlanSets.push(newPlanSet);
-        currentTotalPages += numPages;
-      }
-      setHistory(draft => {
-        draft.planSets = newPlanSets;
-        draft.totalPages = currentTotalPages;
-      });
-      if (planSets.length === 0 && newPlanSets.length > 0) {
-        setPageIndex(0);
-        setZoomLevel(1.0);
-        setActiveTakeoffId(null);
-        setViewMode('canvas');
-      }
-      addToast(`Added ${files.length} plan(s)`, 'success');
-    } catch (error) {
-      console.error("Error loading PDF metadata:", error);
-      addToast("Failed to load PDF file", 'error');
-    } finally {
-      setIsUploadingPdf(false);
-      setUploadLoadingMessage("Loading Project...");
-    }
-  };
-
-  const handleInitiateTool = (tool: ToolType) => {
-    if ([ToolType.LINEAR, ToolType.ARC, ToolType.AREA, ToolType.FILL, ToolType.SEGMENT, ToolType.DIMENSION].includes(tool)) {
-      const scale = getCurrentPageScale();
-      if (!scale.isSet) {
-        addToast("Please set the scale for this page first", 'error');
-        return;
-      }
-    }
-    setPendingTool(tool);
-    setShowNewItemModal(true);
-  };
-
-  const handleEnableDeductionMode = (itemId: string) => {
-    const item = items.find(i => i.id === itemId);
-    if (!item) return;
-    setActiveTakeoffId(itemId);
-    setActiveTool(item.type);
-    setIsDeductionMode(true);
-    addToast("Cutout mode enabled. Draw to subtract.", 'info');
-  };
-
-  const handleCreateTakeoffItem = (data: Partial<TakeoffItem>) => {
-    if (!pendingTool) return;
-    const scale = getCurrentPageScale();
-    let unit = data.unit;
-    if (!unit) {
-      if (pendingTool === ToolType.COUNT) { unit = Unit.EACH; } 
-      else if (pendingTool === ToolType.VOLUME) { unit = Unit.CUBIC_FEET; }
-      else if (pendingTool === ToolType.AREA || pendingTool === ToolType.FILL) { unit = getAreaUnitFromLinear(scale.unit); }
-      else { unit = scale.unit; }
-    }
-    if (pendingTool === ToolType.AREA || pendingTool === ToolType.FILL) { unit = getAreaUnitFromLinear(unit); }
-    const newItem: TakeoffItem = {
-      id: crypto.randomUUID(),
-      label: data.label || 'New Item',
-      type: pendingTool,
-      color: data.color || '#3b82f6',
-      unit: unit,
-      shapes: [],
-      totalValue: 0,
-      visible: true,
-      properties: data.properties || [],
-      formula: data.formula || 'Qty',
-      price: data.price,
-      group: data.group || 'General',
-      subItems: data.subItems || [],
-      depth: data.depth
-    };
-    setHistory(draft => {
-      draft.items.push(newItem);
-    });
-    setActiveTakeoffId(newItem.id);
-    setActiveTool(pendingTool);
-    setIsDeductionMode(false);
-    setShowNewItemModal(false);
-    setPendingTool(null);
-    addToast(`Created item: ${newItem.label}`, 'success');
-  };
-
-  const calculateTotalValue = (shapes: Shape[], item: TakeoffItem) => {
-    const baseValue = shapes.reduce((sum, s) => s.deduction ? sum - s.value : sum + s.value, 0);
-    return item.type === ToolType.VOLUME && item.depth ? baseValue * item.depth : baseValue;
-  };
-
-  const handleBatchCreateItems = (itemsToCreate: { newItemId?: string, sourceItemId: string, shapes: Shape[] }[]) => {
-    const newItemsList: TakeoffItem[] = [];
-    let lastItemId = activeTakeoffId;
-
-    itemsToCreate.forEach(({ newItemId, sourceItemId, shapes }) => {
-      const sourceItem = items.find(i => i.id === sourceItemId);
-      if (!sourceItem) return;
-
-      const newItem: TakeoffItem = {
-        ...sourceItem,
-        id: newItemId || crypto.randomUUID(),
-        label: `${sourceItem.label} (Copy)`,
-        shapes: shapes,
-        totalValue: calculateTotalValue(shapes, item)
-      };
-      newItemsList.push(newItem);
-      lastItemId = newItem.id;
-    });
-
-    if (newItemsList.length > 0) {
-      setHistory(draft => {
-        draft.items.push(...newItemsList);
-      });
-      setActiveTakeoffId(lastItemId);
-      addToast(`Created ${newItemsList.length} new item(s)`, 'success');
-    }
-  };
-
-  const handleBatchAddShapes = (shapesToAdd: { itemId: string, shape: Shape }[]) => {
-    const shapesByItem = shapesToAdd.reduce((acc, { itemId, shape }) => {
-      if (!acc[itemId]) acc[itemId] = [];
-      acc[itemId].push(shape);
-      return acc;
-    }, {} as Record<string, Shape[]>);
-
-    setHistory(draft => {
-      draft.items.forEach(item => {
-        if (shapesByItem[item.id]) {
-          item.shapes.push(...shapesByItem[item.id]);
-          item.totalValue = calculateTotalValue(item.shapes, item);
-        }
-      });
-    });
-    addToast(`Added ${shapesToAdd.length} shapes`, 'success');
-  };
-
-  const handleShapeCreated = (shape: Shape) => {
-    if (!activeTakeoffId) return;
-    if (isDeductionMode) shape.deduction = true;
-    setHistory(draft => {
-      const item = draft.items.find(i => i.id === activeTakeoffId);
-      if (item) {
-        item.shapes.push(shape);
-        item.totalValue = calculateTotalValue(item.shapes, item);
-      }
-    });
-    if (isDeductionMode) {
-      setIsDeductionMode(false);
-      addToast("Cutout added", 'success');
-    }
-  };
-
-  const handleUpdateShape = (itemId: string, shapeId: string, updates: Partial<Shape>) => {
-    setHistory(draft => {
-      const item = draft.items.find(i => i.id === itemId);
-      if (item) {
-        const shape = item.shapes.find(s => s.id === shapeId);
-        if (shape) {
-          Object.assign(shape, updates);
-          item.totalValue = calculateTotalValue(item.shapes, item);
-        }
-      }
-    });
-  };
-
-  const handleUpdateShapeTransient = (itemId: string, updatedShape: Shape) => {
-    setHistoryTransient(draft => {
-      const item = draft.items.find(i => i.id === itemId);
-      if (item) {
-        const index = item.shapes.findIndex(s => s.id === updatedShape.id);
-        if (index !== -1) {
-          item.shapes[index] = updatedShape;
-          item.totalValue = calculateTotalValue(item.shapes, item);
-        }
-      }
-    });
-  };
-
-  const handleBatchUpdateShapesTransient = (updates: { itemId: string, shape: Shape }[]) => {
-    const updatesByItemId = updates.reduce((acc, { itemId, shape }) => {
-      if (!acc[itemId]) {
-        acc[itemId] = [];
-      }
-      acc[itemId].push(shape);
-      return acc;
-    }, {} as Record<string, Shape[]>);
-
-    setHistoryTransient(draft => {
-      draft.items.forEach(item => {
-        if (updatesByItemId[item.id]) {
-          const itemUpdates = updatesByItemId[item.id];
-          itemUpdates.forEach(updatedShape => {
-            const index = item.shapes.findIndex(s => s.id === updatedShape.id);
-            if (index !== -1) {
-              item.shapes[index] = updatedShape;
-            }
-          });
-        }
-      });
-    });
-  };
-
-  const handleSplitShape = (itemId: string, updatedShape: Shape, newShape: Shape) => {
-    setHistory(draft => {
-      const item = draft.items.find(i => i.id === itemId);
-      if (item) {
-        const index = item.shapes.findIndex(s => s.id === updatedShape.id);
-        if (index !== -1) {
-          item.shapes[index] = updatedShape;
-          item.shapes.push(newShape);
-          item.totalValue = calculateTotalValue(item.shapes, item);
-        }
-      }
-    });
-  };
-
-  const handleUpdateItem = (itemId: string, updates: Partial<TakeoffItem>) => {
-    setHistory(draft => {
-      const item = draft.items.find(i => i.id === itemId);
-      if (item) {
-        Object.assign(item, updates);
-      }
-    });
-  };
-
-  const handleDeleteItem = (id: string) => {
-    if (activeTakeoffId === id) { setActiveTakeoffId(null); setActiveTool(ToolType.SELECT); setIsDeductionMode(false); }
-    setHistory(draft => {
-      draft.items = draft.items.filter(i => i.id !== id);
-    });
-    addToast("Item deleted", 'info');
-  };
-
-  const handleToggleItemVisibility = (itemId: string, pageIndex: number) => {
-    setHistory(draft => {
-      const item = draft.items.find(i => i.id === itemId);
-      if (item) {
-        // Migration: If globally hidden, unhide globally so we can manage per-page
-        if (item.visible === false) {
-          item.visible = true;
-        }
-
-        if (!item.hiddenPages) {
-          item.hiddenPages = [];
-        }
-
-        const idx = item.hiddenPages.indexOf(pageIndex);
-        if (idx >= 0) {
-          item.hiddenPages.splice(idx, 1);
-        } else {
-          item.hiddenPages.push(pageIndex);
-        }
-      }
-    });
-  };
-
-  const handleDeleteShape = (itemId: string, shapeId: string) => {
-    setHistory(draft => {
-      const item = draft.items.find(i => i.id === itemId);
-      if (item) {
-        item.shapes = item.shapes.filter(s => s.id !== shapeId);
-        item.totalValue = calculateTotalValue(item.shapes, item);
-      }
-    });
-  };
-
-  const handleDeleteShapes = (shapesToDelete: { itemId: string, shapeId: string }[]) => {
-    // Expand deletion to include contained cutouts
-    const allShapesToDelete = [...shapesToDelete];
-    const processedIds = new Set(shapesToDelete.map(s => s.shapeId));
-
-    shapesToDelete.forEach(({ itemId, shapeId }) => {
-      const item = items.find(i => i.id === itemId);
-      if (!item) return;
-      const shape = item.shapes.find(s => s.id === shapeId);
-
-      if (item.type === ToolType.AREA && shape && !shape.deduction) {
-        const childCutouts = item.shapes.filter(other =>
-          other.deduction &&
-          !processedIds.has(other.id) &&
-          other.points.length > 0 &&
-          isPointInPolygon(other.points[0], shape.points)
-        );
-
-        childCutouts.forEach(child => {
-          allShapesToDelete.push({ itemId: item.id, shapeId: child.id });
-          processedIds.add(child.id);
-        });
-      }
-    });
-
-    const shapeIdSet = new Set(allShapesToDelete.map(s => s.shapeId));
-    setHistory(draft => {
-      draft.items.forEach(item => {
-        const originalLength = item.shapes.length;
-        item.shapes = item.shapes.filter(shape => !shapeIdSet.has(shape.id));
-        if (item.shapes.length !== originalLength) {
-          item.totalValue = calculateTotalValue(item.shapes, item);
-        }
-      });
-    });
-  };
-
-  const handleMoveShapesToItem = (shapesToMove: { itemId: string, shapeId: string }[], targetItemId: string) => {
-    const targetItem = items.find(item => item.id === targetItemId);
-    if (!targetItem) {
-      addToast("Target item not found", 'error');
-      return;
-    }
-
-    const shapesBySource = shapesToMove.reduce((acc, shape) => {
-      if (!acc[shape.itemId]) {
-        acc[shape.itemId] = [];
-      }
-      acc[shape.itemId].push(shape.shapeId);
-      return acc;
-    }, {} as Record<string, string[]>);
-
-    const sourceItemIds = Object.keys(shapesBySource);
-    const movedShapes: Shape[] = [];
-
-    let newItems = items.map(item => {
-      if (sourceItemIds.includes(item.id)) {
-        const shapeIdsToRemove = new Set(shapesBySource[item.id]);
-        const itemShapesToMove = item.shapes.filter(s => shapeIdsToRemove.has(s.id));
-        movedShapes.push(...itemShapesToMove);
-
-        const remainingShapes = item.shapes.filter(s => !shapeIdsToRemove.has(s.id));
-        return {
-          ...item,
-          shapes: remainingShapes,
-          totalValue: calculateTotalValue(remainingShapes, item)
-        };
-      }
-      return item;
-    });
-
-    newItems = newItems.map(item => {
-      if (item.id === targetItemId) {
-        const updatedShapes = [...item.shapes, ...movedShapes];
-        return {
-          ...item,
-          shapes: updatedShapes,
-          totalValue: calculateTotalValue(updatedShapes, item)
-        };
-      }
-      return item;
-    });
-
-    const sourceItemsAfterChange = newItems.filter(item => sourceItemIds.includes(item.id));
-    const emptySourceItemIds = new Set<string>();
-    sourceItemsAfterChange.forEach(item => {
-      if (item.shapes.length === 0) {
-        emptySourceItemIds.add(item.id);
-      }
-    });
-
-    if (emptySourceItemIds.size > 0) {
-      newItems = newItems.filter(item => !emptySourceItemIds.has(item.id));
-      if (activeTakeoffId && emptySourceItemIds.has(activeTakeoffId)) {
-        setActiveTakeoffId(null);
-        setActiveTool(ToolType.SELECT);
-      }
-    }
-
-    const movedShapeIdSet = new Set(shapesToMove.map(s => s.shapeId));
-    setSelectedShapes(prev => prev.filter(sel => !movedShapeIdSet.has(sel.shapeId)));
-
-    setHistory(draft => {
-      // Remove shapes from source items
-      sourceItemIds.forEach(sourceId => {
-        const sourceItem = draft.items.find(i => i.id === sourceId);
-        if (sourceItem) {
-          const shapeIdsToRemove = new Set(shapesBySource[sourceId]);
-          sourceItem.shapes = sourceItem.shapes.filter(s => !shapeIdsToRemove.has(s.id));
-          sourceItem.totalValue = calculateTotalValue(sourceItem.shapes, sourceItem);
-        }
-      });
-
-      // Add to target item
-      const targetDraftItem = draft.items.find(i => i.id === targetItemId);
-      if (targetDraftItem) {
-        targetDraftItem.shapes.push(...movedShapes);
-        targetDraftItem.totalValue = calculateTotalValue(targetDraftItem.shapes, targetDraftItem);
-      }
-
-      // Remove empty source items
-      if (emptySourceItemIds.size > 0) {
-        draft.items = draft.items.filter(item => !emptySourceItemIds.has(item.id));
-      }
-    });
-
-    addToast(`Moved ${shapesToMove.length} shape(s) to ${targetItem.label}`, 'success');
-  };
-
-  const handleResumeTakeoff = (id: string) => {
-    const item = items.find(i => i.id === id);
-    if (item) {
-      if ([ToolType.LINEAR, ToolType.AREA, ToolType.SEGMENT, ToolType.DIMENSION].includes(item.type)) {
-        const scale = getCurrentPageScale();
-        if (!scale.isSet) { addToast("Please set the scale first", 'error'); return; }
-      }
-      setActiveTakeoffId(id); setActiveTool(item.type); setIsDeductionMode(false); setViewMode('canvas');
-    }
-  };
-
-  const handleStopTakeoff = () => { setActiveTakeoffId(null); setActiveTool(ToolType.SELECT); setIsDeductionMode(false); };
-
-  const handleUpdateScale = (pixels: number, realValue: number, unit: Unit) => {
-    const ppu = pixels / realValue;
-    setHistory(draft => {
-      if (!draft.projectData[pageIndex]) {
-        draft.projectData[pageIndex] = { scale: { isSet: false, pixelsPerUnit: 1, unit: Unit.FEET } };
-      }
-      draft.projectData[pageIndex].scale = { isSet: true, pixelsPerUnit: ppu, unit };
-    });
-    addToast("Scale calibrated", 'success');
-  };
-
-  const handleUpdateLegend = (updates: Partial<LegendSettings>) => {
-    setHistoryTransient(draft => {
-      if (!draft.projectData[pageIndex]) {
-        draft.projectData[pageIndex] = { scale: { isSet: false, pixelsPerUnit: 1, unit: Unit.FEET } };
-      }
-      const currentLegend = draft.projectData[pageIndex].legend || { x: 50, y: 50, scale: 1, visible: true };
-      draft.projectData[pageIndex].legend = { ...currentLegend, ...updates };
-    });
-  };
-
-  useEffect(() => {
-    const unlisteners: Promise<() => void>[] = [];
-
-    unlisteners.push(listen('open_help', () => {
-      setHelpModalTab('guide');
-      setShowHelpModal(true);
-    }));
-
-    unlisteners.push(listen('new_project', handleNewProjectRequest));
-    unlisteners.push(listen('open_project', handleLoadProjectClick));
-    unlisteners.push(listen('save_project', handleSaveProject));
-
-    return () => {
-      unlisteners.forEach(u => u.then(f => f()));
-    };
-  }, [handleNewProjectRequest, handleLoadProjectClick, handleSaveProject]);
-
-  // Check for Stripe success return
-  useEffect(() => {
-    const checkSubscriptionSuccess = async () => {
-      const urlParams = new URLSearchParams(window.location.search);
-      const sessionId = urlParams.get('session_id');
-
-      if (sessionId) {
-        // Clear the param immediately so we don't re-trigger on reload
-        window.history.replaceState({}, document.title, window.location.pathname);
-
-        addToast("Purchase completed!", 'success');
-      }
-    };
-
-    checkSubscriptionSuccess();
-  }, [addToast]);
-
-  useKeyboardShortcuts({
-    undo, redo, setTool: (t) => { setActiveTool(t); if (t === ToolType.SELECT) setActiveTakeoffId(null); },
-    toggleDeductionMode: () => { if (activeTakeoffId) setIsDeductionMode(p => !p); },
-    deleteSelectedItem: () => {
-      if (activeTakeoffId) {
-        // Context-aware delete:
-        // If shapes exist on current page, delete only those (Clear from Page)
-        // If NO shapes on current page, delete the entire item (Delete Item)
-        const item = items.find(i => i.id === activeTakeoffId);
-        if (item) {
-          const shapesOnPage = item.shapes.filter(s => s.pageIndex === pageIndex);
-          if (shapesOnPage.length > 0) {
-            handleDeleteShapes(shapesOnPage.map(s => ({ itemId: item.id, shapeId: s.id })));
-            addToast(`Cleared ${shapesOnPage.length} measurement(s) from this page`, 'info');
-          } else {
-            handleDeleteItem(activeTakeoffId);
-          }
-        }
-      }
-    },
-    cancelAction: () => { setActiveTakeoffId(null); setActiveTool(ToolType.SELECT); },
-    zoomIn: () => setZoomLevel(z => Math.min(10, z + 0.25)), zoomOut: () => setZoomLevel(z => Math.max(0.1, z - 0.25)),
-    saveProject: handleSaveProject, nextPage: () => pageIndex < totalPages - 1 && setPageIndex(p => p + 1),
-    prevPage: () => pageIndex > 0 && setPageIndex(p => p - 1), zoomToFit: () => setZoomLevel(1.0),
-    toggleRecord: () => activeTakeoffId && handleStopTakeoff(), toggleViewMode: () => setViewMode(viewMode === 'canvas' ? 'estimates' : viewMode === 'estimates' ? '3d' : 'canvas'),
-    finishShape: () => activeTakeoffId && handleStopTakeoff(), copyItem: () => { }, pasteItem: () => { },
-    openSearch: () => setShowPDFSearch(prev => !prev)
-  });
-
-  if (isInitializing || isUploadingPdf) {
-    return (
-      <div className="h-screen w-screen flex flex-col items-center justify-center bg-slate-50 gap-6">
-        <div className="relative">
-          <div className="w-16 h-16 border-4 border-slate-200 border-t-blue-600 rounded-full animate-spin"></div>
-        </div>
-        <div className="text-center space-y-2"><h2 className="text-xl font-semibold text-slate-800">{isUploadingPdf ? uploadLoadingMessage : loadingMessage}</h2></div>
-      </div>
-    );
-  }
-
-  const currentScale = getCurrentPageScale();
-  const currentLegend = projectData[pageIndex]?.legend || { x: 50, y: 50, scale: 1, visible: true };
-  const activePlan = getActivePlanDetails();
-
-  return (
-    <div className="flex h-screen w-screen bg-slate-50 overflow-hidden font-sans">
-      <Sidebar
-        items={items} activeTakeoffId={activeTakeoffId} selectedShapes={selectedShapes} onDelete={handleDeleteItem} onResume={handleResumeTakeoff} onStop={handleStopTakeoff}
-        onSelect={setActiveTakeoffId} onOpenUploadModal={() => setShowUploadModal(true)} planSets={planSets} pageIndex={pageIndex}
-        setPageIndex={setPageIndex} totalPages={totalPages} projectData={projectData}
-        scaleInfo={{ isSet: currentScale.isSet, unit: currentScale.unit, ppu: currentScale.pixelsPerUnit }}
-        onToggleVisibility={handleToggleItemVisibility}
-        onShowEstimates={() => { handleStopTakeoff(); setViewMode('estimates'); }}
-        onShow3D={() => { handleStopTakeoff(); setViewMode('3d'); }}
-        onRenamePage={(i, n) => setHistory(draft => {
-          if (!draft.projectData[i]) {
-            draft.projectData[i] = { scale: { isSet: false, pixelsPerUnit: 1, unit: Unit.FEET } };
-          }
-          draft.projectData[i].name = n;
-        })}
-        onDeletePage={(i) => { setPageToDelete(i); setShowDeletePageConfirm(true); }}
-        onEditItem={setEditingItem} onRenameItem={(id, n) => handleUpdateItem(id, { label: n })}
-        onMoveShapesToItem={handleMoveShapesToItem}
-        projectName={projectName} onNewProject={handleNewProjectRequest} onSaveProject={handleSaveProject} onLoadProject={handleLoadProjectClick}
-        isSaving={isSaving} lastSavedAt={lastSavedAt} activeTool={activeTool} onOpenExportModal={() => setShowExportModal(true)}
-        onOpenHelp={() => setShowHelpModal(true)}
-        onDeleteShapes={handleDeleteShapes}
-      />
-      <main className="flex-1 relative flex flex-col h-full overflow-hidden">
-        {viewMode === 'estimates' ? (
-          <EstimatesView items={items} onBack={() => setViewMode('canvas')} onDeleteItem={handleDeleteItem} onUpdateItem={handleUpdateItem}
-            onReorderItems={(newItems) => setHistory(draft => { draft.items = newItems; })} onEditItem={setEditingItem} />
-        ) : viewMode === '3d' ? (
-          <ThreeDView items={items} onBack={() => setViewMode('canvas')} planSets={planSets} pageIndex={pageIndex} />
-        ) : (
-          <>
-            {planSets.length > 0 && (
-              <Tools activeTool={activeTool} setTool={(t) => { setActiveTool(t); if (t === ToolType.SELECT) setActiveTakeoffId(null); setIsDeductionMode(false); }}
-                onInitiateTool={handleInitiateTool} scale={zoomLevel} setScale={setZoomLevel} onSetPresetScale={setPendingPreset}
-                isRecording={!!activeTakeoffId && activeTool !== ToolType.SELECT} onUndo={undo} onRedo={redo} canUndo={canUndo} canRedo={canRedo}
-                isLegendVisible={currentLegend.visible ?? true} onToggleLegend={() => handleUpdateLegend({ visible: !(currentLegend.visible ?? true) })}
-                isPageScaled={currentScale.isSet}
-                onOpenSearch={() => setShowPDFSearch(prev => !prev)}
-                isSearchOpen={showPDFSearch} />
-            )}
-            <BlueprintCanvas
-              key={pageIndex}
-              ref={canvasRef}
-              file={activePlan?.file || null}
-              fileId={activePlan?.id || ''}
-              localPageIndex={activePlan?.localPageIndex || 0}
-              globalPageIndex={pageIndex}
-              onPageWidthChange={() => { }} activeTool={activeTool} items={items} activeTakeoffId={activeTakeoffId} isDeductionMode={isDeductionMode}
-              onEnableDeduction={handleEnableDeductionMode} onSelectTakeoffItem={setActiveTakeoffId} onSelectionChanged={setSelectedShapes} onShapeCreated={handleShapeCreated}
-              onUpdateShape={handleUpdateShape} onUpdateShapeTransient={handleUpdateShapeTransient} onBatchUpdateShapesTransient={handleBatchUpdateShapesTransient} onSplitShape={handleSplitShape}
-              onUpdateScale={handleUpdateScale} onUpdateLegend={handleUpdateLegend} legendSettings={currentLegend} onDeleteShape={handleDeleteShape} onDeleteShapes={handleDeleteShapes}
-              onBatchCreateItems={handleBatchCreateItems}
-              onBatchAddShapes={handleBatchAddShapes}
-              onMoveShapesToItem={handleMoveShapesToItem}
-              onStopRecording={handleStopTakeoff} onInteractionEnd={commitHistory}
-              scaleInfo={{ isSet: currentScale.isSet, ppu: currentScale.pixelsPerUnit, unit: currentScale.unit }}
-              zoomLevel={zoomLevel} setZoomLevel={setZoomLevel} pendingPreset={pendingPreset} clearPendingPreset={() => setPendingPreset(null)}
-              searchHighlights={searchHighlights}
-              currentSearchHitIndex={currentSearchHitIndex} />
-            <PDFSearch
-              isOpen={showPDFSearch}
-              onClose={() => setShowPDFSearch(false)}
-              onNavigateToPage={setPageIndex}
-              currentPageIndex={pageIndex}
-              onHighlightsChange={setSearchHighlights}
-              onCurrentHitChange={setCurrentSearchHitIndex}
-            />
-          </>
-        )}
-      </main>
-      {showUploadModal && <UploadModal onUpload={handleUpload} onCancel={() => setShowUploadModal(false)} isFirstUpload={planSets.length === 0} />}
-      {showNewItemModal && pendingTool && <NewItemModal toolType={pendingTool} existingCount={items.length} onCreate={handleCreateTakeoffItem} onCancel={() => { setShowNewItemModal(false); setPendingTool(null); }} />}
-      {editingItem && <PropertiesModal item={editingItem} items={items} onSave={handleUpdateItem} onClose={() => setEditingItem(null)} />}
-      <HelpModal isOpen={showHelpModal} onClose={() => setShowHelpModal(false)} initialTab={helpModalTab} />
-      <ExportModal isOpen={showExportModal} planSets={planSets} projectData={projectData} currentPageIndex={pageIndex} isExporting={isExporting} progress={exportProgress} onClose={() => setShowExportModal(false)} onExport={handleExportPDF} />
-      <PromptModal isOpen={showNewProjectPrompt} title="Create New Project" message="Enter a name for the new project." placeholder="My Project" onConfirm={(name) => handleNewProjectConfirmed(name).then(() => setViewMode('canvas'))} onCancel={() => setShowNewProjectPrompt(false)} confirmText="Create Project" />
-      <ConfirmModal isOpen={showImportConfirm} title="Import Project?" message="Loading a project will replace the current workspace." onConfirm={() => handleImportConfirmed().then(() => setViewMode('canvas'))} onCancel={() => { setShowImportConfirm(false); setPendingImportPath(null); }} confirmText="Import Project" isDestructive />
-      <ConfirmModal isOpen={showDeletePageConfirm} title="Delete Page?" message="Are you sure you want to delete this page?" onConfirm={() => { /* Logic to be implemented */ setShowDeletePageConfirm(false); }} onCancel={() => setShowDeletePageConfirm(false)} confirmText="Delete Page" isDestructive />
-    </div>
-  );
+import { useState, useCallback } from "react";
+import {
+  detectElectricalComponents,
+  DetectionResult,
+  DetectedComponent,
+  groupByRoom,
+  getReviewItems,
+} from "./analyze_pdf";
+
+// ─── Theme colours matching ElectraScan design system ───
+const C = {
+  bgDark:  "#0D1B2A",
+  navy:    "#112236",
+  blue:    "#1D6EFD",
+  blueLt:  "#3B82F6",
+  green:   "#10B981",
+  amber:   "#F59E0B",
+  red:     "#EF4444",
+  purple:  "#8B5CF6",
+  text:    "#E2E8F0",
+  muted:   "#64748B",
+  border:  "#1E3A5F",
 };
 
-const App: React.FC = () => (
-  <RamCacheProvider>
-    <AppContent />
-  </RamCacheProvider>
-);
+// ─── Screen type ─────────────────────────────────────────
+type Screen = "upload" | "scanning" | "results";
 
-export default App;
+// ─── Component label map (plain English for tradies) ─────
+const LABELS: Record<string, string> = {
+  GPO_STANDARD:       "Power Point (Single)",
+  GPO_DOUBLE:         "Power Point (Double)",
+  GPO_WEATHERPROOF:   "Weatherproof GPO",
+  GPO_USB:            "USB Power Point",
+  DOWNLIGHT_RECESSED: "Downlight (Recessed)",
+  PENDANT_FEATURE:    "Pendant / Feature Light",
+  EXHAUST_FAN:        "Exhaust Fan",
+  SWITCHING_STANDARD: "Light Switch",
+  SWITCHING_DIMMER:   "Dimmer Switch",
+  SWITCHING_2WAY:     "2-Way Switch",
+  SWITCHBOARD_MAIN:   "Main Switchboard (MSB)",
+  SWITCHBOARD_SUB:    "Sub Board",
+  AC_SPLIT:           "Split System AC",
+  AC_DUCTED:          "Ducted AC",
+  DATA_CAT6:          "Data Point (Cat6)",
+  DATA_TV:            "TV / Antenna Point",
+  SECURITY_CCTV:      "CCTV Camera",
+  SECURITY_INTERCOM:  "Intercom",
+  SECURITY_ALARM:     "Alarm Sensor",
+  EV_CHARGER:         "EV Charger",
+  POOL_OUTDOOR:       "Pool / Outdoor Equipment",
+  GATE_ACCESS:        "Gate / Access Control",
+  AUTOMATION_HUB:     "Home Automation",
+};
+
+const FLAG_LABELS: Record<string, string> = {
+  HEIGHT_RISK:            "Height Risk — scaffold required",
+  AUTOMATION_DEPENDENCY:  "Automation — programmer needed",
+  MISSING_CIRCUIT:        "Missing circuit on drawing",
+  SCOPE_CONFIRM:          "Confirm scope with architect",
+  OUTDOOR_LOCATION:       "Outdoor — weatherproof required",
+  OFF_FORM_PREMIUM:       "Off-form premium applies",
+  CABLE_RUN_LONG:         "Long cable run — verify length",
+  LOW_CONFIDENCE:         "Low confidence — verify on drawing",
+  SYMBOL_AMBIGUOUS:       "Ambiguous symbol — check manually",
+};
+
+// ─── Styles (inline for single-file simplicity) ──────────
+const s: Record<string, React.CSSProperties> = {
+  app: {
+    minHeight: "100vh",
+    background: C.bgDark,
+    color: C.text,
+    fontFamily: "'DM Sans', system-ui, sans-serif",
+  },
+  header: {
+    background: C.navy,
+    borderBottom: `1px solid ${C.border}`,
+    padding: "0 24px",
+    height: 56,
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+  },
+  logo: {
+    fontSize: 18,
+    fontWeight: 700,
+    color: C.blue,
+    letterSpacing: "-0.02em",
+  },
+  logoSpan: { color: C.text },
+  badge: {
+    fontSize: 11,
+    background: "#1E3A5F",
+    color: C.blueLt,
+    padding: "2px 8px",
+    borderRadius: 4,
+    fontWeight: 500,
+  },
+  main: {
+    maxWidth: 720,
+    margin: "0 auto",
+    padding: "40px 24px",
+  },
+  card: {
+    background: C.navy,
+    border: `1px solid ${C.border}`,
+    borderRadius: 12,
+    padding: 24,
+    marginBottom: 16,
+  },
+  uploadZone: {
+    border: `2px dashed ${C.border}`,
+    borderRadius: 12,
+    padding: "48px 24px",
+    textAlign: "center" as const,
+    cursor: "pointer",
+    transition: "all 0.2s",
+  },
+  uploadZoneActive: {
+    border: `2px dashed ${C.blue}`,
+    background: "#0D2347",
+  },
+  h1: {
+    fontSize: 28,
+    fontWeight: 700,
+    marginBottom: 8,
+    letterSpacing: "-0.02em",
+  },
+  h2: {
+    fontSize: 20,
+    fontWeight: 600,
+    marginBottom: 16,
+  },
+  p: {
+    color: C.muted,
+    fontSize: 15,
+    lineHeight: 1.6,
+    marginBottom: 0,
+  },
+  btn: {
+    background: C.blue,
+    color: "#fff",
+    border: "none",
+    borderRadius: 8,
+    padding: "12px 24px",
+    fontSize: 15,
+    fontWeight: 600,
+    cursor: "pointer",
+    display: "inline-flex",
+    alignItems: "center",
+    gap: 8,
+  },
+  btnGhost: {
+    background: "transparent",
+    color: C.muted,
+    border: `1px solid ${C.border}`,
+    borderRadius: 8,
+    padding: "10px 20px",
+    fontSize: 14,
+    cursor: "pointer",
+  },
+  row: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 12,
+  },
+  tag: (color: string) => ({
+    display: "inline-block",
+    fontSize: 11,
+    fontWeight: 500,
+    padding: "2px 8px",
+    borderRadius: 4,
+    background: color + "22",
+    color: color,
+    marginRight: 4,
+  }),
+  componentRow: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    padding: "12px 0",
+    borderBottom: `1px solid ${C.border}`,
+    gap: 12,
+  },
+  confBar: (pct: number) => ({
+    width: 60,
+    height: 4,
+    background: "#1E3A5F",
+    borderRadius: 2,
+    overflow: "hidden" as const,
+    display: "inline-block",
+    verticalAlign: "middle",
+  }),
+  confFill: (pct: number) => ({
+    height: "100%",
+    width: `${pct}%`,
+    background: pct >= 90 ? C.green : pct >= 70 ? C.amber : C.red,
+    borderRadius: 2,
+  }),
+  totalRow: {
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "center",
+    padding: "16px 0 0",
+    borderTop: `1px solid ${C.border}`,
+    marginTop: 8,
+  },
+  scanAnim: {
+    textAlign: "center" as const,
+    padding: "60px 24px",
+  },
+  pulse: {
+    width: 80,
+    height: 80,
+    borderRadius: "50%",
+    background: C.blue + "22",
+    border: `2px solid ${C.blue}`,
+    margin: "0 auto 24px",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    fontSize: 32,
+    animation: "pulse 1.5s ease-in-out infinite",
+  },
+  riskHigh:   { color: C.red,    fontSize: 13 },
+  riskMed:    { color: C.amber,  fontSize: 13 },
+  riskInfo:   { color: C.blueLt, fontSize: 13 },
+};
+
+// ─── Confidence bar component ─────────────────────────────
+function ConfBar({ value }: { value: number }) {
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+      <div style={s.confBar(value)}>
+        <div style={s.confFill(value)} />
+      </div>
+      <span style={{ fontSize: 12, color: C.muted }}>{value}%</span>
+    </div>
+  );
+}
+
+// ─── Upload screen ────────────────────────────────────────
+function UploadScreen({
+  onFile,
+}: {
+  onFile: (file: File) => void;
+}) {
+  const [dragging, setDragging] = useState(false);
+
+  const handleDrop = useCallback(
+    (e: React.DragEvent) => {
+      e.preventDefault();
+      setDragging(false);
+      const file = e.dataTransfer.files[0];
+      if (file && file.type === "application/pdf") onFile(file);
+    },
+    [onFile]
+  );
+
+  const handleInput = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) onFile(file);
+  };
+
+  return (
+    <div>
+      <style>{`
+        @keyframes pulse {
+          0%, 100% { transform: scale(1); opacity: 1; }
+          50% { transform: scale(1.08); opacity: 0.8; }
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { background: ${C.bgDark}; }
+      `}</style>
+
+      <div style={{ marginBottom: 32 }}>
+        <h1 style={s.h1}>Scan a drawing</h1>
+        <p style={s.p}>
+          Upload an electrical drawing PDF from your email or files. ElectraScan will automatically detect every GPO, downlight, switchboard and more — then build your estimate.
+        </p>
+      </div>
+
+      <label style={{ display: "block", cursor: "pointer" }}>
+        <div
+          style={{
+            ...s.uploadZone,
+            ...(dragging ? s.uploadZoneActive : {}),
+          }}
+          onDragOver={(e) => { e.preventDefault(); setDragging(true); }}
+          onDragLeave={() => setDragging(false)}
+          onDrop={handleDrop}
+        >
+          <div style={{ fontSize: 48, marginBottom: 16 }}>📄</div>
+          <div style={{ fontSize: 17, fontWeight: 600, marginBottom: 8 }}>
+            Drop your PDF here
+          </div>
+          <div style={{ color: C.muted, fontSize: 14, marginBottom: 20 }}>
+            or tap to choose from your files or email
+          </div>
+          <span style={s.btn}>
+            Choose PDF
+          </span>
+        </div>
+        <input
+          type="file"
+          accept="application/pdf"
+          style={{ display: "none" }}
+          onChange={handleInput}
+        />
+      </label>
+
+      <div style={{ ...s.card, marginTop: 24 }}>
+        <div style={{ fontSize: 13, fontWeight: 600, color: C.muted, marginBottom: 12, textTransform: "uppercase" as const, letterSpacing: "0.06em" }}>
+          What gets detected
+        </div>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+          {[
+            "Power points (GPO)",
+            "Downlights & fans",
+            "Switches & dimmers",
+            "Main & sub boards",
+            "AC units",
+            "Data & TV points",
+            "Security & CCTV",
+            "EV chargers",
+            "Pool equipment",
+            "Home automation",
+          ].map((item) => (
+            <div key={item} style={{ fontSize: 13, color: C.muted, display: "flex", alignItems: "center", gap: 6 }}>
+              <span style={{ color: C.green }}>✓</span> {item}
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Scanning screen ──────────────────────────────────────
+function ScanningScreen({ fileName }: { fileName: string }) {
+  return (
+    <div style={s.scanAnim}>
+      <div style={s.pulse}>⚡</div>
+      <h2 style={{ ...s.h2, marginBottom: 8 }}>Scanning drawing...</h2>
+      <p style={s.p}>
+        Claude Vision is reading <strong style={{ color: C.text }}>{fileName}</strong>
+        <br />and detecting electrical components.
+        <br />This takes about 20–40 seconds.
+      </p>
+      <div style={{ marginTop: 24, color: C.muted, fontSize: 13 }}>
+        Detecting GPOs · Lighting · Switchboards · AC · Security · EV...
+      </div>
+    </div>
+  );
+}
+
+// ─── Results screen ───────────────────────────────────────
+function ResultsScreen({
+  result,
+  fileName,
+  onReset,
+}: {
+  result: DetectionResult;
+  fileName: string;
+  onReset: () => void;
+}) {
+  const [activeTab, setActiveTab] = useState<"schedule" | "risks">("schedule");
+  const byRoom = groupByRoom(result.components);
+  const reviewItems = getReviewItems(result.components);
+  const highRisks = result.risk_flags.filter((f) => f.level === "high");
+
+  const tabStyle = (active: boolean): React.CSSProperties => ({
+    padding: "8px 16px",
+    fontSize: 14,
+    fontWeight: 500,
+    borderRadius: 6,
+    border: "none",
+    cursor: "pointer",
+    background: active ? C.blue : "transparent",
+    color: active ? "#fff" : C.muted,
+  });
+
+  return (
+    <div>
+      {/* Summary header */}
+      <div style={s.card}>
+        <div style={s.row}>
+          <div>
+            <div style={{ fontSize: 13, color: C.muted, marginBottom: 4 }}>
+              {fileName} · {result.page_count} page{result.page_count !== 1 ? "s" : ""} · Scale {result.scale_detected}
+            </div>
+            <h2 style={{ ...s.h2, marginBottom: 0 }}>
+              {result.components.length} components detected
+            </h2>
+          </div>
+          <button style={s.btnGhost} onClick={onReset}>
+            New scan
+          </button>
+        </div>
+
+        {/* Stats row */}
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 12, marginTop: 20 }}>
+          <div style={{ background: "#0D1B2A", borderRadius: 8, padding: 14 }}>
+            <div style={{ fontSize: 22, fontWeight: 700, color: C.text }}>
+              ${result.estimate_subtotal.toLocaleString()}
+            </div>
+            <div style={{ fontSize: 12, color: C.muted }}>Estimate subtotal ex GST</div>
+          </div>
+          <div style={{ background: "#0D1B2A", borderRadius: 8, padding: 14 }}>
+            <div style={{ fontSize: 22, fontWeight: 700, color: reviewItems.length > 0 ? C.amber : C.green }}>
+              {reviewItems.length}
+            </div>
+            <div style={{ fontSize: 12, color: C.muted }}>Items need review</div>
+          </div>
+          <div style={{ background: "#0D1B2A", borderRadius: 8, padding: 14 }}>
+            <div style={{ fontSize: 22, fontWeight: 700, color: highRisks.length > 0 ? C.red : C.green }}>
+              {highRisks.length}
+            </div>
+            <div style={{ fontSize: 12, color: C.muted }}>High risk flags</div>
+          </div>
+        </div>
+      </div>
+
+      {/* Tabs */}
+      <div style={{ display: "flex", gap: 4, marginBottom: 16 }}>
+        <button style={tabStyle(activeTab === "schedule")} onClick={() => setActiveTab("schedule")}>
+          Component schedule
+        </button>
+        <button style={tabStyle(activeTab === "risks")} onClick={() => setActiveTab("risks")}>
+          Risk flags {result.risk_flags.length > 0 && `(${result.risk_flags.length})`}
+        </button>
+      </div>
+
+      {/* Schedule tab */}
+      {activeTab === "schedule" && (
+        <div>
+          {Object.entries(byRoom).map(([room, components]) => (
+            <div key={room} style={s.card}>
+              <div style={{ fontSize: 13, fontWeight: 600, color: C.muted, marginBottom: 12, textTransform: "uppercase" as const, letterSpacing: "0.06em" }}>
+                {room}
+              </div>
+              {components.map((c: DetectedComponent, i: number) => (
+                <div key={i} style={s.componentRow}>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontSize: 14, fontWeight: 500, marginBottom: 4 }}>
+                      {LABELS[c.type] ?? c.type}
+                      {c.flags.includes("LOW_CONFIDENCE") && (
+                        <span style={{ ...s.tag(C.amber), marginLeft: 6 }}>Review</span>
+                      )}
+                    </div>
+                    {c.flags.filter(f => f !== "LOW_CONFIDENCE").map(f => (
+                      <span key={f} style={s.tag(C.muted)}>{FLAG_LABELS[f] ?? f}</span>
+                    ))}
+                    {c.notes && (
+                      <div style={{ fontSize: 12, color: C.muted, marginTop: 4 }}>{c.notes}</div>
+                    )}
+                  </div>
+                  <div style={{ textAlign: "center" as const, minWidth: 32 }}>
+                    <div style={{ fontSize: 18, fontWeight: 700 }}>{c.quantity}</div>
+                    <div style={{ fontSize: 11, color: C.muted }}>qty</div>
+                  </div>
+                  <div style={{ textAlign: "right" as const, minWidth: 80 }}>
+                    <div style={{ fontSize: 14, fontWeight: 600 }}>
+                      ${c.line_total.toLocaleString()}
+                    </div>
+                    <ConfBar value={c.confidence} />
+                  </div>
+                </div>
+              ))}
+              <div style={{ textAlign: "right" as const, paddingTop: 10, fontSize: 13, color: C.muted }}>
+                Room total: <strong style={{ color: C.text }}>
+                  ${components.reduce((s: number, c: DetectedComponent) => s + c.line_total, 0).toLocaleString()}
+                </strong>
+              </div>
+            </div>
+          ))}
+
+          {/* Grand total */}
+          <div style={s.card}>
+            <div style={s.totalRow}>
+              <span style={{ fontSize: 16, fontWeight: 600 }}>Subtotal (ex GST)</span>
+              <span style={{ fontSize: 22, fontWeight: 700, color: C.blue }}>
+                ${result.estimate_subtotal.toLocaleString()}
+              </span>
+            </div>
+            <div style={{ ...s.totalRow, borderTop: "none", paddingTop: 8 }}>
+              <span style={{ fontSize: 14, color: C.muted }}>GST (10%)</span>
+              <span style={{ fontSize: 14, color: C.muted }}>
+                ${(result.estimate_subtotal * 0.1).toLocaleString()}
+              </span>
+            </div>
+            <div style={{ ...s.totalRow, borderTop: `1px solid ${C.border}`, paddingTop: 16, marginTop: 8 }}>
+              <span style={{ fontSize: 16, fontWeight: 700 }}>Total inc GST</span>
+              <span style={{ fontSize: 24, fontWeight: 700, color: C.green }}>
+                ${(result.estimate_subtotal * 1.1).toLocaleString()}
+              </span>
+            </div>
+            <div style={{ marginTop: 20, display: "flex", gap: 10 }}>
+              <button style={s.btn}>Export PDF quote</button>
+              <button style={s.btnGhost}>Export CSV</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Risks tab */}
+      {activeTab === "risks" && (
+        <div>
+          {result.risk_flags.length === 0 ? (
+            <div style={{ ...s.card, textAlign: "center" as const, padding: 40 }}>
+              <div style={{ fontSize: 32, marginBottom: 12 }}>✓</div>
+              <div style={{ color: C.green, fontWeight: 600 }}>No risk flags detected</div>
+            </div>
+          ) : (
+            result.risk_flags.map((flag, i) => (
+              <div key={i} style={s.card}>
+                <div style={s.row}>
+                  <div>
+                    <span style={
+                      flag.level === "high" ? s.riskHigh :
+                      flag.level === "medium" ? s.riskMed : s.riskInfo
+                    }>
+                      {flag.level === "high" ? "⚠ HIGH" : flag.level === "medium" ? "● MEDIUM" : "ℹ INFO"}
+                    </span>
+                    <div style={{ fontSize: 15, fontWeight: 600, marginTop: 6 }}>
+                      {LABELS[flag.component_type] ?? flag.component_type}
+                    </div>
+                  </div>
+                </div>
+                <p style={{ ...s.p, marginTop: 8, fontSize: 14 }}>{flag.description}</p>
+              </div>
+            ))
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Root App ─────────────────────────────────────────────
+export default function App() {
+  const [screen, setScreen] = useState<Screen>("upload");
+  const [file, setFile] = useState<File | null>(null);
+  const [result, setResult] = useState<DetectionResult | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const handleFile = async (f: File) => {
+    setFile(f);
+    setError(null);
+    setScreen("scanning");
+
+    try {
+      const detection = await detectElectricalComponents(f, "001");
+      setResult(detection);
+      setScreen("results");
+    } catch (err: any) {
+      setError(err?.message ?? "Detection failed. Please try again.");
+      setScreen("upload");
+    }
+  };
+
+  const handleReset = () => {
+    setFile(null);
+    setResult(null);
+    setError(null);
+    setScreen("upload");
+  };
+
+  return (
+    <div style={s.app}>
+      {/* Header */}
+      <div style={s.header}>
+        <div style={s.logo}>
+          Electra<span style={s.logoSpan}>Scan</span>
+        </div>
+        <div style={s.badge}>Vesh Electrical · Beta</div>
+      </div>
+
+      {/* Main content */}
+      <div style={s.main}>
+        {error && (
+          <div style={{ ...s.card, borderColor: C.red, marginBottom: 20 }}>
+            <div style={{ color: C.red, fontWeight: 600, marginBottom: 4 }}>Detection error</div>
+            <div style={{ color: C.muted, fontSize: 14 }}>{error}</div>
+          </div>
+        )}
+
+        {screen === "upload" && <UploadScreen onFile={handleFile} />}
+        {screen === "scanning" && file && <ScanningScreen fileName={file.name} />}
+        {screen === "results" && result && file && (
+          <ResultsScreen result={result} fileName={file.name} onReset={handleReset} />
+        )}
+      </div>
+    </div>
+  );
+}
