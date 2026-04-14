@@ -94,6 +94,7 @@ const EstimatesView: React.FC<EstimatesViewProps> = ({ items, onBack, onDeleteIt
             const allData: any[] = [];
 
             items.filter(i => i.type !== ToolType.NOTE).forEach(item => {
+              try {
                 const convertedQty = convertValue(item.totalValue, Unit.FEET, item.unit, item.type);
                 const calculated = evaluateFormula(item, convertedQty);
                 let totalCost = calculated * (item.price || 0);
@@ -150,11 +151,29 @@ const EstimatesView: React.FC<EstimatesViewProps> = ({ items, onBack, onDeleteIt
                     Unit: item.unit,
                     UnitPrice: unitPrice,
                     TotalCost: totalCost,
-                    Pages: Array.from(new Set(item.shapes.map(s => Number(s.pageIndex) + 1))).sort((a: number, b: number) => a - b).join(', '),
+                    Pages: Array.from(new Set((item.shapes ?? []).map(s => Number(s.pageIndex) + 1))).sort((a: number, b: number) => a - b).join(', '),
                 });
 
                 // Add Sub Items Rows
                 allData.push(...subItemRows);
+              } catch (itemErr) {
+                console.error('[handleExport] Failed while processing item:', {
+                    id: item.id,
+                    label: item.label,
+                    type: item.type,
+                    group: item.group,
+                    unit: item.unit,
+                    totalValue: item.totalValue,
+                    price: item.price,
+                    formula: item.formula,
+                    hasShapes: Array.isArray(item.shapes),
+                    shapesLength: item.shapes?.length,
+                    subItemsLength: item.subItems?.length,
+                    error: itemErr,
+                    stack: itemErr instanceof Error ? itemErr.stack : undefined,
+                }, item);
+                throw itemErr;
+              }
             });
 
             const ws = XLSX.utils.json_to_sheet(allData);
@@ -163,8 +182,14 @@ const EstimatesView: React.FC<EstimatesViewProps> = ({ items, onBack, onDeleteIt
             XLSX.writeFile(wb, "Project_Estimates.xlsx");
             addToast("Excel export successful", 'success');
         } catch (e) {
-            console.error(e);
-            addToast("Export failed", 'error');
+            console.error('[handleExport] Export aborted:', {
+                message: e instanceof Error ? e.message : String(e),
+                name: e instanceof Error ? e.name : undefined,
+                stack: e instanceof Error ? e.stack : undefined,
+                itemsCount: items?.length,
+                error: e,
+            });
+            addToast(`Export failed: ${e instanceof Error ? e.message : 'unknown error'}`, 'error');
         }
     };
 
