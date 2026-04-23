@@ -15,6 +15,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import * as pdfjsLib from "pdfjs-dist";
 pdfjsLib.GlobalWorkerOptions.workerSrc = `https://unpkg.com/pdfjs-dist@${pdfjsLib.version}/build/pdf.worker.min.mjs`;
 import { mapLegendItem, type CatalogueItem } from "./vesh_catalogue";
+import { extractTextFromPDF, formatOCRForPrompt, type PageTextContent } from "./ocr_extract";
 
 // ─────────────────────────────────────────────
 // TYPES
@@ -79,6 +80,16 @@ export interface DetectionResult {
   estimate_subtotal: number;
   raw_response: string;
   raw_legend_response: string;
+  ocr_pages?: PageTextContent[];
+  title_block?: {
+    drawingNumber: string | null;
+    revision: string | null;
+    projectName: string | null;
+    drawingTitle: string | null;
+    date: string | null;
+    engineer: string | null;
+    scale: string | null;
+  } | null;
 }
 
 export interface RiskFlag {
@@ -481,7 +492,18 @@ export async function detectElectricalComponents(
   });
 
   console.log(`[ElectraScan v4] Converting: ${file.name}`);
-  const pageImages = await pdfToImages(file);
+  const [pageImages, ocrPages] = await Promise.all([
+    pdfToImages(file),
+    extractTextFromPDF(file).catch(() => [] as PageTextContent[]),
+  ]);
+
+  const ocrContext = ocrPages.length > 0 ? formatOCRForPrompt(ocrPages) : "";
+  const titleBlock = ocrPages[0]?.titleBlock ?? null;
+
+  if (ocrContext) {
+    console.log(`[ElectraScan v4] OCR: extracted text from ${ocrPages.length} pages`);
+  }
+
   const imageBlocks: Anthropic.ImageBlockParam[] = pageImages.map(base64 => ({
     type: "image" as const,
     source: { type: "base64" as const, media_type: "image/png" as const, data: base64 },
@@ -503,7 +525,10 @@ export async function detectElectricalComponents(
         role: "user",
         content: [
           ...imageBlocks,
-          { type: "text", text: `Drawing: ${file.name}. Find the legend table and extract every item including its visual symbol appearance. Include ALL items that need electrical wiring including motorised blinds, ceiling fans, LED strips, heated towel rails.` },
+          {
+            type: "text",
+            text: `Drawing: ${file.name}. Find the legend table and extract every item including its visual symbol appearance. Include ALL items that need electrical wiring including motorised blinds, ceiling fans, LED strips, heated towel rails.${ocrContext ? `\n\nEMBEDDED TEXT LAYER (use to verify legend labels and quantities):\n${ocrContext}` : ""}`,
+          },
         ],
       }],
     });
@@ -537,7 +562,10 @@ export async function detectElectricalComponents(
         role: "user",
         content: [
           ...imageBlocks,
-          { type: "text", text: `Drawing: ${file.name}. Scan every room and count each symbol type using the decoder. Total quantities must match the legend.` },
+          {
+            type: "text",
+            text: `Drawing: ${file.name}. Scan every room and count each symbol type using the decoder. Total quantities must match the legend.${ocrContext ? `\n\nEMBEDDED TEXT (use room labels and annotations from this layer to name rooms accurately):\n${ocrContext}` : ""}`,
+          },
         ],
       }],
     });
@@ -568,6 +596,8 @@ export async function detectElectricalComponents(
     estimate_subtotal: estimateSubtotal,
     raw_response: rawResponse,
     raw_legend_response: rawLegendResponse,
+    ocr_pages: ocrPages,
+    title_block: titleBlock,
   };
 }
 
